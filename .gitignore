@@ -1,5 +1,7 @@
 
 # Python venv
 .venv/
+.gemini/
+.data/
 __pycache__/
 .ipynb_checkpoints/
