@@ -229,6 +229,44 @@ def _safe_float(val) -> float | None:
         return None
 
 
+def _fetch_live_contract_quote(
+    session: requests.Session,
+    event_ticker: str,
+    contract_id: str,
+) -> dict | None:
+    """Fetch live bid/ask for a specific Gemini prediction contract.
+
+    Called at the moment of entry or early exit to get the true current
+    execution price rather than the up-to-60s-stale CSV value.
+
+    Returns {bid_yes, ask_yes, bid_no, ask_no} or None on any failure.
+    """
+    try:
+        r = session.get(
+            f"{GEMINI_BASE_URL}/v1/prediction-markets/events",
+            timeout=10,
+        )
+        r.raise_for_status()
+        data   = r.json()
+        events = data.get("data", data) if isinstance(data, dict) else data
+        for event in events:
+            if event.get("ticker") != event_ticker:
+                continue
+            for contract in event.get("contracts", []):
+                if str(contract.get("id", "")) != str(contract_id):
+                    continue
+                prices = contract.get("prices", {})
+                return {
+                    "bid_yes": _safe_float(prices.get("sell", {}).get("yes")),
+                    "ask_yes": _safe_float(prices.get("buy",  {}).get("yes")),
+                    "bid_no":  _safe_float(prices.get("sell", {}).get("no")),
+                    "ask_no":  _safe_float(prices.get("buy",  {}).get("no")),
+                }
+    except Exception:
+        pass
+    return None
+
+
 def _fetch_live_spots(session: requests.Session) -> dict[str, float]:
     """Fetch current bid/ask midpoint for each asset from the Gemini public ticker.
 
@@ -648,7 +686,11 @@ def _try_settle(pos: dict, minute_df: pd.DataFrame | None, now_utc: datetime) ->
     if minute_df.index[-1] < settle_ts:
         return False  # OHLCV not yet updated past settlement
 
-    bars = minute_df.loc[minute_df.index <= settle_ts]
+    # Use bars strictly BEFORE settle_ts: the last such bar's close is the
+    # price at exactly settle_ts (candle timestamps mark the open, so the
+    # 13:59 bar's close = price at 14:00 = correct settlement reference).
+    # Using <= would include the 14:00 bar whose close is the price at 14:01.
+    bars = minute_df.loc[minute_df.index < settle_ts]
     if bars.empty:
         return False
 
@@ -986,6 +1028,16 @@ def run(
     seen_stud:   set[str] = set()
     seen_skt:    set[str] = set()
     seen_heston: set[str] = set()
+    # Maps model name → its seen_set so closed positions can be removed,
+    # allowing re-entry if a new edge appears on the same contract later.
+    seen_by_model: dict[str, set[str]] = {
+        "gbm":       seen_gbm,
+        "ewma":      seen_ewma,
+        "garch":     seen_garch,
+        "student_t": seen_stud,
+        "skewed_t":  seen_skt,
+        "heston":    seen_heston,
+    }
     open_positions:   list[dict] = []
     closed_positions: list[dict] = []
 
@@ -1041,11 +1093,25 @@ def run(
             )
 
             if exit_info:
+                # ── Live quote: use true bid at moment of exit ───────────────
+                live_q = _fetch_live_contract_quote(
+                    session, pos.get("event_ticker", ""), pos["contract_id"]
+                )
+                if live_q is not None:
+                    side = pos["side"]
+                    fresh_bid = live_q["bid_yes"] if side == "YES" else live_q["bid_no"]
+                    if fresh_bid is not None:
+                        exit_info["exit_bid"] = fresh_bid
+                        exit_info["exit_pnl"] = round(
+                            fresh_bid - float(pos["ask_price"]), 4
+                        )
                 _apply_early_exit(pos, exit_info, now_utc)
                 closed_positions.append(pos)
                 _append_csv(trade_out, pos, TRADE_FIELDS)
                 _log_exit(pos, exit_info)
                 ledger_stats = _update_performance_ledger()
+                # Allow re-entry: remove from seen so edge is re-evaluated next poll.
+                seen_by_model.get(pos["model"], set()).discard(pos["contract_id"])
             else:
                 still_open.append(pos)
         open_positions = still_open
@@ -1059,6 +1125,8 @@ def run(
                 _append_csv(trade_out, pos, TRADE_FIELDS)
                 _log_settle(pos)
                 ledger_stats = _update_performance_ledger()
+                # Contract is expired — no re-entry possible, but discard for consistency.
+                seen_by_model.get(pos["model"], set()).discard(pos["contract_id"])
             else:
                 still_open.append(pos)
         open_positions = still_open
@@ -1204,6 +1272,21 @@ def run(
 
                 if side is None:
                     continue
+
+                # ── Live quote: re-validate edge at true execution price ──────
+                # The CSV ask may be up to 60s stale. Fetch the live order book
+                # now; if the ask has moved and edge is gone, skip the trade.
+                live_q = _fetch_live_contract_quote(
+                    session, row.get("event_ticker", ""), contract_id
+                )
+                if live_q is not None:
+                    fresh_ask = live_q["ask_yes"] if side == "YES" else live_q["ask_no"]
+                    if fresh_ask is not None:
+                        fresh_edge = round(p_side - fresh_ask, 4)
+                        if fresh_edge <= min_edge:
+                            continue  # edge gone by execution time — skip
+                        ask_price = fresh_ask
+                        edge_val  = fresh_edge
 
                 # Market mid for the side we're trading
                 mid_yes = _safe_float(row.get("mid_yes"))

@@ -145,7 +145,13 @@ than it is right now — important for contracts more than 30 minutes out.
 ## Entry and exit logic
 
 **Entry:** we buy when any model shows edge > 3¢.  Each model trades
-independently (up to one open position per contract per model at a time).
+independently — up to one open position per contract per model at a time.
+After a position closes (for any reason), the contract becomes eligible for
+re-entry on the next poll if a fresh edge appears.
+
+Before entering, the sim fetches a **live quote** from the Gemini API to
+confirm the current ask price.  If the ask has moved and the edge has
+disappeared since the last CSV poll, the trade is skipped.
 
 **Exit — whichever fires first:**
 
@@ -154,7 +160,18 @@ independently (up to one open position per contract per model at a time).
 | **Profit lock** | bid rose 5¢ from entry | Lock in gain before the market reverses |
 | **Stop loss** | bid fell 10¢ from entry | Cap downside; don't ride to zero |
 | **P-drop** | model p(side) fell 5 pp from entry | New data made the bet worse; get out early |
+| **Edge closed** | current edge turned negative | Market has corrected; take the spread now |
 | **Natural settlement** | contract expires | Look up final spot price and book result |
+
+On early exit, the sim fetches a **live bid** from the Gemini API so the
+recorded `exit_bid` and P&L reflect the true execution price rather than the
+(up-to-60s-stale) CSV value.
+
+**Settlement correctness:** the settlement price is the OHLCV close of the
+last 1-minute bar that *opens strictly before* the settle timestamp.  Because
+Gemini candles are stamped at their open time, the bar at `T−1m` closes at
+exactly `T` — making it the correct reference for a contract settling at `T`.
+Including the bar that opens at `T` would use a price from `T+1m` (look-ahead).
 
 ---
 
@@ -166,7 +183,7 @@ independently (up to one open position per contract per model at a time).
    (because Heston sees elevated vol-of-vol risk) — that's useful information.
 3. **Built-in model comparison.** The performance ledger gives live,
    out-of-sample evidence of which model's probability estimates are best
-   calibrated on Kalshi specifically.  Over time we can weight toward winners
+   calibrated on Gemini specifically.  Over time we can weight toward winners
    or cut underperformers.
 
 ---

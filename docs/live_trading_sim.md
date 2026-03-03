@@ -6,7 +6,7 @@ only need to start one of them — the simulation auto-launches the other two.
 ```
 live_trading_sim.py              ← start this
   └─ getdata_underlying.py       ← auto-started (1-min OHLCV updater)
-  └─ getdata_prediction_contract.py  ← auto-started (Kalshi contract prices)
+  └─ getdata_prediction_contract.py  ← auto-started (Gemini prediction contract prices)
 ```
 
 ---
@@ -123,6 +123,39 @@ length share a single pre-computed return array (no redundant reads).
 
 ---
 
+## Entry and exit execution
+
+The contract CSV (written by `getdata_prediction_contract.py`) has up to 60s
+lag.  To avoid entering at a stale price or exiting at a stale bid, the sim
+makes a direct Gemini API call at the moment of execution:
+
+- **Entry:** after the CSV edge check passes, a live quote is fetched.  If the
+  ask has moved and the edge is gone, the trade is skipped.  Otherwise the
+  fresh ask is used as the recorded entry price.
+
+- **Early exit:** after a profit-lock / stop-loss / p-drop / edge-closed
+  signal fires, a live bid is fetched and used as `exit_bid` so the recorded
+  P&L is accurate.
+
+Settlement uses OHLCV data (not market prices), so no live quote is needed
+there.  The settlement price is the close of the last 1-minute bar whose open
+is strictly before the settle timestamp — the correct look-ahead-free reference.
+
+**Exit conditions (first one to fire wins):**
+
+| Condition | Trigger |
+|---|---|
+| `profit_lock` | `bid_now − ask_entry ≥ profit_lock` (default 5¢) |
+| `stop_loss` | `ask_entry − bid_now ≥ stop_loss` (default 10¢) |
+| `p_drop` | model p(side) fell by ≥ `p_drop` from entry (default 5 pp) |
+| `edge_closed` | current edge for our side turned negative |
+| settlement | contract expired; spot looked up from OHLCV |
+
+After any exit, the contract becomes eligible for re-entry on the next poll
+if a new edge appears (no session-long blacklist).
+
+---
+
 ## Output files
 
 ```
@@ -147,7 +180,7 @@ python getdata_underlying.py                    # default 60 s poll
 python getdata_underlying.py --poll-sec 30
 python getdata_underlying.py --symbols btcusd ethusd
 
-# Kalshi contract prices
+# Gemini prediction contract prices
 python getdata_prediction_contract.py           # default 60 s poll
 python getdata_prediction_contract.py --poll-sec 30
 ```

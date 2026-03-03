@@ -5,16 +5,15 @@ This workflow is implemented in [`btc_hourly_model.py`](../btc_hourly_model.py).
 ## What it does
 
 1. Loads Gemini minute OHLCV from `.data` files.
-2. Builds hourly contracts in `America/New_York` (EST/EDT):
-   - trade at `hh:58`
-   - settle at `trade_time + 60 minutes`
-3. Calibrates:
-   - GBM (`mu`, `sigma`) from hourly log returns
-   - Student's t (`loc`, `scale`, `nu`) for fat tails
-4. Produces walk-forward hourly probabilities `P(settle_price > strike)`.
-5. Includes a simple distributional-ML baseline:
-   - linear mean head for return
-   - linear variance head for log-variance
+2. Calibrates six models from rolling 1-minute log-return windows:
+   - **GBM** — rolling σ, closed-form Black-Scholes binary price
+   - **EWMA** — exponentially-weighted σ (λ = 0.94), same closed form
+   - **GARCH(1,1)** — MLE-fit α, β, ω; longer lookback for stability
+   - **Student-t** — fat-tail MC (20 k paths), fits ν from return series
+   - **Skewed-t** — Fernández-Steel; γ (skew) from elastic-net on vol-return regression
+   - **Heston SV** — full-truncation Euler MC; κ, ξ from AR(1) on hourly realised variance
+3. Produces `P(settle_price > strike)` for each model independently.
+4. All calibration uses data strictly before the evaluation timestamp — no look-ahead.
 
 ## Quick start
 
@@ -56,6 +55,7 @@ Short answer: yes, if execution and microstructure matter.
 
 ## Next upgrade path
 
-1. Replace linear mean/variance heads with nonlinear models (e.g., boosted trees or neural nets).
+1. Replace linear vol estimates with nonlinear models (e.g., boosted trees on engineered features).
 2. Predict full distribution directly (quantiles or parametric outputs like `mu`, `sigma`, `nu`).
-3. Optimize against your contract payoff (expected value after fees/slippage), not only Brier/logloss.
+3. Optimize against contract payoff (expected value after spread), not only Brier/logloss.
+4. Use tick or 5-second data for execution-time models once trading real size.
