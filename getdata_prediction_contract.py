@@ -231,8 +231,12 @@ def poll_once(
             ask_no  = _safe_float(prices.get("buy",  {}).get("no"))
             last    = _safe_float(prices.get("lastTradePrice"))
 
-            mid_yes  = ((bid_yes or 0) + (ask_yes or 0)) / 2 if (bid_yes and ask_yes) \
-                       else (bid_yes or ask_yes)
+            if bid_yes is not None and ask_yes is not None:
+                mid_yes = (bid_yes + ask_yes) / 2
+            elif bid_yes is not None:
+                mid_yes = bid_yes
+            else:
+                mid_yes = ask_yes
             arb_long = round(ask_yes + ask_no - 1.0, 4) \
                        if (ask_yes is not None and ask_no is not None) else None
 

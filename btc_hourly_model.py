@@ -83,10 +83,14 @@ class EWMAParams:
     Attributes:
         sigma_per_sqrt_hour: Current conditional vol scaled to per-sqrt-hour.
         lambda_: Decay factor used (typically 0.94, RiskMetrics standard).
+        mu_per_hour: GBM-consistent drift (per hour), estimated from the
+            sample mean of 1-min log returns in the calibration window:
+            mu = mean(r) / dt + 0.5 * sigma^2.
     """
 
     sigma_per_sqrt_hour: float
     lambda_: float
+    mu_per_hour: float
 
 
 @dataclass
@@ -99,12 +103,16 @@ class GARCHParams:
         omega, alpha, beta: GARCH coefficients (MLE estimated).
         sigma_per_sqrt_hour: Current conditional vol (terminal value of the
             GARCH recursion), scaled to per-sqrt-hour.
+        mu_per_hour: GBM-consistent drift (per hour), estimated from the
+            sample mean of 1-min log returns in the calibration window:
+            mu = mean(r) / dt + 0.5 * sigma^2.
     """
 
     omega: float
     alpha: float
     beta: float
     sigma_per_sqrt_hour: float
+    mu_per_hour: float
 
 
 @dataclass
@@ -302,9 +310,14 @@ def calibrate_ewma_from_log_returns(
         var = lambda_ * var + (1.0 - lambda_) * ret ** 2
     var = max(var, 1e-18)
 
+    sigma = sqrt(var / dt_hours)
+    # GBM-consistent drift: same formula as calibrate_gbm_from_log_returns
+    mu_per_hour = float(np.mean(r)) / dt_hours + 0.5 * sigma * sigma
+
     return EWMAParams(
-        sigma_per_sqrt_hour=sqrt(var / dt_hours),
+        sigma_per_sqrt_hour=sigma,
         lambda_=lambda_,
+        mu_per_hour=mu_per_hour,
     )
 
 
@@ -318,17 +331,17 @@ def ewma_binary_prob(
     """Binary contract probability under GBM with EWMA conditional vol.
 
     Identical closed-form to gbm_binary_prob but uses the EWMA conditional
-    sigma rather than the rolling-window estimate.  Drift is set to zero
-    (unidentifiable at 1-hour horizons).
+    sigma rather than the rolling-window estimate.  Drift mu is calibrated
+    from the sample mean of the return window (see EWMAParams.mu_per_hour).
     """
     if trade_price <= 0 or strike_price <= 0:
         raise ValueError("Prices must be positive")
 
-    sigma = max(params.sigma_per_sqrt_hour, 1e-12)
-    t     = horizon_hours
-    # Zero drift (drift is noise at sub-day horizons)
-    std_lr = sigma * sqrt(t)
-    x      = np.log(strike_price / trade_price) / std_lr
+    sigma   = max(params.sigma_per_sqrt_hour, 1e-12)
+    t       = horizon_hours
+    mean_lr = (params.mu_per_hour - 0.5 * sigma * sigma) * t
+    std_lr  = sigma * sqrt(t)
+    x       = (np.log(strike_price / trade_price) - mean_lr) / std_lr
     p_above = float(1.0 - _normal_cdf(x))
     return p_above if direction == "above" else float(1.0 - p_above)
 
@@ -389,11 +402,16 @@ def calibrate_garch_from_log_returns(
         var_t = omega + alpha * ret ** 2 + beta * var_t
         var_t = max(var_t, 1e-18)
 
+    sigma = sqrt(var_t / dt_hours)
+    # GBM-consistent drift: same formula as calibrate_gbm_from_log_returns
+    mu_per_hour = float(np.mean(r)) / dt_hours + 0.5 * sigma * sigma
+
     return GARCHParams(
         omega=omega,
         alpha=alpha,
         beta=beta,
-        sigma_per_sqrt_hour=sqrt(var_t / dt_hours),
+        sigma_per_sqrt_hour=sigma,
+        mu_per_hour=mu_per_hour,
     )
 
 
@@ -407,14 +425,17 @@ def garch_binary_prob(
     """Binary contract probability under GBM with GARCH(1,1) conditional vol.
 
     Uses the current GARCH conditional sigma in the GBM closed form.
-    Drift is set to zero (noise at sub-day horizons).
+    Drift mu is calibrated from the sample mean of the return window (see
+    GARCHParams.mu_per_hour).
     """
     if trade_price <= 0 or strike_price <= 0:
         raise ValueError("Prices must be positive")
 
     sigma   = max(params.sigma_per_sqrt_hour, 1e-12)
-    std_lr  = sigma * sqrt(horizon_hours)
-    x       = np.log(strike_price / trade_price) / std_lr
+    t       = horizon_hours
+    mean_lr = (params.mu_per_hour - 0.5 * sigma * sigma) * t
+    std_lr  = sigma * sqrt(t)
+    x       = (np.log(strike_price / trade_price) - mean_lr) / std_lr
     p_above = float(1.0 - _normal_cdf(x))
     return p_above if direction == "above" else float(1.0 - p_above)
 
@@ -769,120 +790,3 @@ def parse_event_ticker(ticker: str) -> tuple[str, datetime] | tuple[None, None]:
     )
     return g["asset"], settle
 
-
-def compute_event_fair_value(
-    spot: float,
-    strike: float,
-    settle_time_utc: datetime,
-    minute_df: pd.DataFrame,
-    eval_time: pd.Timestamp | None = None,
-    lookback_hours: float = 48.0,
-    direction: Direction = "above",
-) -> dict | None:
-    """GBM fair value for a live Gemini prediction market contract.
-
-    Can be called at any point during the contract's life, not just at entry.
-
-    Parameters
-    ----------
-    spot            : Current underlying price S_t.
-    strike          : Contract strike K.
-    settle_time_utc : Contract settlement datetime (UTC-aware).
-    minute_df       : 1-minute OHLCV with EST-aware DatetimeIndex.
-    eval_time       : Evaluation timestamp (defaults to latest bar in minute_df).
-    lookback_hours  : Window for vol calibration (no look-ahead; only bars < eval_time).
-    direction       : "above" → P(S_T > K); "below" → P(S_T < K).
-
-    Returns dict with fair value and diagnostics, or None if insufficient data.
-    """
-    if eval_time is None:
-        eval_time = minute_df.index[-1]
-
-    # Convert settle_time to same tz as minute_df index
-    settle_est = pd.Timestamp(settle_time_utc).tz_convert(minute_df.index.tz)
-    horizon_hours = (settle_est - eval_time).total_seconds() / 3600.0
-
-    if horizon_hours <= 0:
-        # Contract already settled
-        realized = float(spot > strike) if direction == "above" else float(spot <= strike)
-        return {"p_fair_gbm": realized, "horizon_hours": 0.0, "sigma_annual": None}
-
-    min_lr = _minute_log_returns_before(minute_df, eval_time, lookback_hours)
-    if len(min_lr) < 20:
-        return None
-
-    gbm = calibrate_gbm_from_log_returns(min_lr, dt_hours=1 / 60)
-    p_fair = gbm_binary_prob(spot, strike, gbm, horizon_hours=horizon_hours, direction=direction)
-    sigma_annual = gbm.sigma_per_sqrt_hour * sqrt(8_760)  # annualised vol
-
-    return {
-        "eval_time": eval_time,
-        "settle_time_est": settle_est,
-        "horizon_hours": horizon_hours,
-        "S_t": spot,
-        "strike": strike,
-        "direction": direction,
-        "sigma_annual": sigma_annual,
-        "p_fair_gbm": p_fair,
-    }
-
-
-def compute_fair_value_path(
-    minute_df: pd.DataFrame,
-    strike: float,
-    settle_time_utc: datetime,
-    lookback_hours: float = 48.0,
-    contract_life_hours: float = 24.0,
-    direction: Direction = "above",
-) -> pd.DataFrame:
-    """Compute GBM fair value at every minute during a contract's life.
-
-    Used for backtesting: compare p_fair_gbm column against p_market (from
-    getdata_prediction_contract.py recordings) to measure and validate edge.
-
-    Parameters
-    ----------
-    minute_df           : 1-minute OHLCV (EST-aware index).
-    strike              : Contract strike K.
-    settle_time_utc     : Settlement time (UTC-aware datetime).
-    lookback_hours      : Rolling calibration window (strictly before each bar).
-    contract_life_hours : How far back from settle_time the contract was listed.
-    direction           : "above" or "below".
-
-    Returns
-    -------
-    DataFrame with one row per minute. Key columns:
-        t, horizon_hours, S_t, strike, p_fair_gbm, realized_above, sigma_annual
-    """
-    settle_est = pd.Timestamp(settle_time_utc).tz_convert(minute_df.index.tz)
-    start_est = settle_est - pd.Timedelta(hours=contract_life_hours)
-
-    life_bars = minute_df.loc[
-        (minute_df.index >= start_est) & (minute_df.index < settle_est)
-    ]
-    if life_bars.empty:
-        return pd.DataFrame()
-
-    # Terminal price for realized outcome (last bar at or before settle)
-    bars_at_or_before_settle = minute_df.loc[minute_df.index <= settle_est]
-    sT = float(bars_at_or_before_settle["close"].iloc[-1]) if not bars_at_or_before_settle.empty else float("nan")
-    realized = float(sT > strike) if direction == "above" else float(sT <= strike)
-
-    rows = []
-    for t, bar in life_bars.iterrows():
-        result = compute_event_fair_value(
-            spot=float(bar["close"]),
-            strike=strike,
-            settle_time_utc=settle_time_utc,
-            minute_df=minute_df,
-            eval_time=t,
-            lookback_hours=lookback_hours,
-            direction=direction,
-        )
-        if result is None:
-            continue
-        result["sT"] = sT
-        result["realized"] = realized
-        rows.append(result)
-
-    return pd.DataFrame(rows)

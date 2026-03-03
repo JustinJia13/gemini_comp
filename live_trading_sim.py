@@ -74,6 +74,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 
 import config_loader as cfg
 from btc_hourly_model import (
@@ -103,7 +104,8 @@ OHLCV_ROOT    = Path(".data/gemini/ohlcv_1m_7d")
 CONTRACT_ROOT = Path(".data/gemini/prediction_data")
 SIM_ROOT      = Path(".data/gemini/sim_trades")
 
-ASSET_SYMBOLS = {"BTC": "btcusd", "ETH": "ethusd", "SOL": "solusd"}
+ASSET_SYMBOLS   = {"BTC": "btcusd", "ETH": "ethusd", "SOL": "solusd"}
+GEMINI_BASE_URL = "https://api.gemini.com"
 
 TRADE_FIELDS = [
     "entry_time_utc",
@@ -219,12 +221,35 @@ def _append_csv(path: Path, row: dict, fields: list[str]) -> None:
 
 
 def _safe_float(val) -> float | None:
-    if not val:
+    if val is None:
         return None
     try:
         return float(val)
     except (ValueError, TypeError):
         return None
+
+
+def _fetch_live_spots(session: requests.Session) -> dict[str, float]:
+    """Fetch current bid/ask midpoint for each asset from the Gemini public ticker.
+
+    OHLCV files only contain *closed* candles (by construction in
+    getdata_underlying.py), so the last bar is always 1-2 minutes old.
+    The OHLCV file is a calibration store, not a live price feed — this
+    function provides the actual current spot for the pricing formula.
+
+    Falls back gracefully per-asset: if the API call fails, that asset's
+    entry is absent and the caller falls back to the last OHLCV close.
+    """
+    spots: dict[str, float] = {}
+    for asset, sym in ASSET_SYMBOLS.items():
+        try:
+            r = session.get(f"{GEMINI_BASE_URL}/v1/pubticker/{sym}", timeout=5)
+            r.raise_for_status()
+            data = r.json()
+            spots[asset] = (float(data["bid"]) + float(data["ask"])) / 2.0
+        except Exception:
+            pass  # caller falls back to OHLCV last close
+    return spots
 
 
 def _load_minute_df(asset: str) -> pd.DataFrame | None:
@@ -267,7 +292,7 @@ def _latest_by_contract(rows: list[dict]) -> dict[str, dict]:
 
 def _compute_edges(
     contract_id: str,
-    asset: str,
+    spot: float,
     strike: float,
     direction: str,
     ask_yes: float | None,
@@ -282,6 +307,12 @@ def _compute_edges(
     """Calibrate all 6 models and return fair values + edge signals.
 
     Models: gbm | ewma | garch | student_t | skewed_t | heston
+
+    `spot` is the current underlying price, fetched live from the Gemini
+    ticker by the caller — NOT read from the OHLCV file.  The OHLCV file
+    only contains closed candles (always 1-2 min old), so it is used solely
+    for vol calibration.  Separating live spot from historical calibration
+    data removes the need for an OHLCV staleness guard.
 
     Each model uses its own calibration window (lookbacks dict) so shorter-
     window models stay reactive while longer-window models gain MLE stability.
@@ -298,8 +329,6 @@ def _compute_edges(
     horizon_hours = (settle_ts - eval_ts).total_seconds() / 3600.0
     if horizon_hours <= 0:
         return None
-
-    spot = float(minute_df["close"].iloc[-1])
 
     # Per-model log-return arrays — cached by window size to avoid re-reading.
     _lr_cache: dict[float, object] = {}
@@ -491,6 +520,7 @@ def _check_early_exit(
     pos: dict,
     latest_row: dict | None,
     minute_df: pd.DataFrame | None,
+    spot: float | None,
     lookbacks: dict[str, float],
     now_utc: datetime,
     profit_lock: float,
@@ -530,8 +560,8 @@ def _check_early_exit(
     if -realised_pnl >= stop_loss:
         return {"exit_reason": "stop_loss", "exit_bid": bid_now, "exit_pnl": realised_pnl}
 
-    # --- 3 & 4. Model-based exits (require fresh calibration) ---
-    if minute_df is not None:
+    # --- 3 & 4. Model-based exits (require fresh calibration + live spot) ---
+    if minute_df is not None and spot is not None:
         try:
             strike          = float(pos["strike"])
             direction       = pos["direction"]
@@ -541,7 +571,7 @@ def _check_early_exit(
 
             edges = _compute_edges(
                 contract_id     = pos["contract_id"],
-                asset           = pos["asset"],
+                spot            = spot,
                 strike          = strike,
                 direction       = direction,
                 ask_yes         = ask_yes,
@@ -738,15 +768,12 @@ def _fmt_label(pos: dict) -> str:
     return f"{label} {arrow}"
 
 
-def _fmt_settle(settle_time_utc_str: str, ref_utc: datetime | None = None) -> str:
-    """Return e.g. '@8PM EST (T-50min)' from a UTC ISO string."""
+def _fmt_settle(settle_time_utc_str: str) -> str:
+    """Return e.g. '@8PM EST' from a UTC ISO string."""
     try:
         settle_utc = datetime.fromisoformat(settle_time_utc_str)
         settle_est = settle_utc.astimezone(EST_TZ)
         hour_str   = settle_est.strftime("%I%p").lstrip("0")   # "8PM"
-        if ref_utc is not None:
-            t_min = round((settle_utc - ref_utc).total_seconds() / 60)
-            return f"@{hour_str} EST (T-{t_min}min)"
         return f"@{hour_str} EST"
     except Exception:
         return ""
@@ -970,6 +997,9 @@ def run(
                 proc.terminate()
     atexit.register(_cleanup_collectors)
 
+    session = requests.Session()
+    atexit.register(session.close)
+
     while True:
         t0      = time.time()
         now_utc = datetime.now(tz=timezone.utc)
@@ -979,8 +1009,17 @@ def run(
             asset: _load_minute_df(asset) for asset in ASSET_SYMBOLS
         }
 
-        rows    = _read_contract_csv(today)
-        latest  = _latest_by_contract(rows)  # {contract_id: most-recent-row}
+        rows   = _read_contract_csv(today)
+        latest = _latest_by_contract(rows)  # {contract_id: most-recent-row}
+
+        # ── Live spot prices — primary source for pricing formula ────────────
+        # OHLCV only contains closed candles (1-2 min lag by design); the ticker
+        # gives the true current market price.  Fall back per-asset to the last
+        # OHLCV close only if the API call fails.
+        live_spots: dict[str, float] = _fetch_live_spots(session)
+        for asset, mdf in minute_dfs.items():
+            if asset not in live_spots and mdf is not None:
+                live_spots[asset] = float(mdf["close"].iloc[-1])
 
         # ── 1. Early-exit checks for all open positions ─────────────────────
         still_open: list[dict] = []
@@ -990,9 +1029,15 @@ def run(
             lat_row = latest.get(cid)
 
             exit_info = _check_early_exit(
-                pos, lat_row, mdf, lookbacks, now_utc,
-                profit_lock, stop_loss, p_drop,
-                ewma_lambda=ewma_lambda, rho=rho,
+                pos, lat_row, mdf,
+                spot     = live_spots.get(pos["asset"]),
+                lookbacks= lookbacks,
+                now_utc  = now_utc,
+                profit_lock = profit_lock,
+                stop_loss   = stop_loss,
+                p_drop      = p_drop,
+                ewma_lambda = ewma_lambda,
+                rho         = rho,
             )
 
             if exit_info:
@@ -1019,7 +1064,11 @@ def run(
         open_positions = still_open
 
         # ── 3. Entry decisions for new contracts ─────────────────────────────
-        for row in rows:
+        # Iterate the *latest* row per contract — not the full history.
+        # Using latest.values() ensures we always price against the freshest
+        # bid/ask quote; iterating all rows would enter on the oldest quote
+        # for any contract first seen at startup.
+        for row in latest.values():
             contract_id = row.get("contract_id", "")
             if not contract_id:
                 continue
@@ -1029,13 +1078,16 @@ def run(
             if minute_df is None:
                 continue
 
+            spot = live_spots.get(asset)
+            if spot is None:
+                continue  # live spot unavailable for this asset (API + OHLCV both failed)
+
             ask_yes = _safe_float(row.get("ask_yes"))
             ask_no  = _safe_float(row.get("ask_no"))
             try:
                 strike          = float(row["strike"])
                 direction       = row["direction"]
                 settle_time_utc = datetime.fromisoformat(row["settle_time_utc"])
-                eval_time_utc   = datetime.fromisoformat(row["timestamp_utc"])
                 hours_to_settle = float(row["hours_to_settle"])
             except (KeyError, ValueError):
                 continue
@@ -1056,13 +1108,13 @@ def run(
 
             edges = _compute_edges(
                 contract_id     = contract_id,
-                asset           = asset,
+                spot            = spot,
                 strike          = strike,
                 direction       = direction,
                 ask_yes         = ask_yes,
                 ask_no          = ask_no,
                 settle_time_utc = settle_time_utc,
-                eval_time_utc   = eval_time_utc,
+                eval_time_utc   = now_utc,
                 minute_df       = minute_df,
                 lookbacks       = lookbacks,
                 ewma_lambda     = ewma_lambda,
@@ -1131,9 +1183,10 @@ def run(
                 ("skewed_t",  "skt",    seen_skt,    need_skt),
                 ("heston",    "heston", seen_heston, need_heston),
             ]:
-                if not needed or edges is None:
-                    seen_set.add(contract_id)
-                    continue
+                if not needed:
+                    continue  # already evaluated for this model
+                if edges is None:
+                    continue  # OHLCV stale or insufficient — retry next poll
 
                 seen_set.add(contract_id)
 

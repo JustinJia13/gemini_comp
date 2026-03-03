@@ -19,7 +19,7 @@ max_hours_to_collect  = 24.0    # used only when hourly_only = false
 [simulation]
 # -----------------------------------------------------------------------------
 poll_sec         = 60       # seconds between simulation polls
-min_edge         = 0.03     # minimum model edge required to enter a trade
+min_edge         = 0.04     # minimum model edge required to enter a trade
                             # (e.g. 0.03 = model must show 3 cents of edge at ask)
 max_hours_to_settle = 1.5   # ignore any contract settling more than this many hours
                             # away — guards against stale multi-day data in the CSV
