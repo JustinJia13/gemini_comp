@@ -194,9 +194,23 @@ def _edge_out_path() -> Path:
 
 
 def _ensure_header(path: Path, fields: list[str]) -> None:
+    """Write header if missing; rewrite in-place if the header is stale."""
+    expected = ",".join(fields)
     if not path.exists() or path.stat().st_size == 0:
         with path.open("w", newline="") as f:
             csv.DictWriter(f, fieldnames=fields).writeheader()
+        return
+    with path.open("r", newline="") as f:
+        first = f.readline().rstrip("\r\n")
+    if first == expected:
+        return  # header is current — nothing to do
+    # Header is stale: rewrite with correct header, keep all data rows.
+    with path.open("r", newline="") as f:
+        lines = f.readlines()
+    lines[0] = expected + "\n"
+    with path.open("w", newline="") as f:
+        f.writelines(lines)
+    print(f"  [header] Updated stale header in {path.name}")
 
 
 def _append_csv(path: Path, row: dict, fields: list[str]) -> None:
