@@ -8,7 +8,7 @@
 
 ### The market
 
-We're trading on **Kalshi**, a regulated prediction market where contracts pay
+We're trading on **Gemini**, a prediction contracts pay
 exactly $1 if a condition is true at expiry and $0 if not.  Our contracts ask:
 *"Will BTC / ETH / SOL close above price X at time T?"*  These are called
 **binary options** — the payout is binary, but the price trades continuously
