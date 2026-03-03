@@ -1,0 +1,41 @@
+# =============================================================================
+# Gemini Prediction Market Pipeline — Configuration
+# =============================================================================
+# All values here are defaults.  Every parameter can be overridden at runtime
+# with the matching CLI flag (e.g.  --poll-sec 30).
+
+# -----------------------------------------------------------------------------
+[data_collector]
+# -----------------------------------------------------------------------------
+poll_sec              = 60      # seconds between API polls
+
+hourly_only           = true    # true  → next 1-hour EST contract only (default)
+                                # false → all BTC/ETH/SOL contracts within
+                                #         max_hours_to_collect hours
+max_hours_to_collect  = 24.0    # used only when hourly_only = false
+                                # skips any contract settling further than this
+
+# -----------------------------------------------------------------------------
+[simulation]
+# -----------------------------------------------------------------------------
+poll_sec         = 60       # seconds between simulation polls
+lookback_hours   = 48.0     # rolling window for volatility calibration (hours)
+min_edge         = 0.03     # minimum model edge required to enter a trade
+                            # (e.g. 0.03 = model must show 3 cents of edge at ask)
+max_hours_to_settle = 1.5   # ignore any contract settling more than this many hours
+                            # away — guards against stale multi-day data in the CSV
+
+[simulation.exit]
+# Early-exit conditions — checked every poll for every open position.
+# Any condition that fires causes an immediate sell at the current bid price;
+# realised P&L = bid_now - ask_entry.
+
+profit_lock      = 0.05     # exit when bid_now - ask_entry >= this
+                            # (locks in a 5¢ gain before the market can reverse)
+
+stop_loss        = 0.10     # exit when ask_entry - bid_now >= this
+                            # (caps maximum loss at 10¢ per $1 notional)
+
+p_drop           = 0.05     # exit when the model's probability for our side
+                            # drops by this much vs. the entry probability
+                            # (new data has made the bet worse; exit early)

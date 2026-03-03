@@ -1,29 +1,27 @@
-"""Hourly BTC contract modeling with GBM and Student's t fat-tail returns.
+"""Hourly BTC/ETH/SOL contract modeling with GBM and Student's t fat-tail returns.
 
-This module is built for Gemini 1-minute OHLCV `.data` files. It creates
-hourly prediction contracts where you trade 2 minutes before each hour and
-settle 60 minutes later.
+This module provides calibration and fair-value functions consumed by the live
+trading simulation (live_trading_sim.py) and the data collector
+(getdata_prediction_contract.py).
 
 Model family 1 (traditional SDE / GBM):
     dS_t / S_t = mu dt + sigma dW_t
 
 Model family 2 (fat-tail extension):
     log-return ~ Student's t with calibrated degrees of freedom.
-
-The code intentionally keeps dependencies minimal (`numpy`, `pandas`) so it
-can run in lightweight notebook environments.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from math import erf, sqrt
 from pathlib import Path
 from typing import Literal, Optional
 
 import numpy as np
 import pandas as pd
-from contract_pricing import three_contract_strikes_from_anchor
 
 
 Direction = Literal["above", "below"]
@@ -56,89 +54,14 @@ class StudentTParams:
     nu: float
 
 
-@dataclass
-class DistLinearModel:
-    """Two-head linear model for mean and variance of 1-hour log returns.
-
-    mean_head:
-        E[r | x] = x @ beta_mean
-    variance_head:
-        log Var[r | x] = x @ beta_log_var
-    """
-
-    feature_cols: list[str]
-    beta_mean: np.ndarray
-    beta_log_var: np.ndarray
-
-
 def load_gemini_ohlcv(path: str | Path) -> pd.DataFrame:
-    """Load Gemini `.data` minute OHLCV and return UTC-indexed DataFrame."""
-    df = pd.read_csv(path)
-    required = {"timestamp_ms", "open", "high", "low", "close", "volume"}
+    """Load Gemini `.data` minute OHLCV. Index is the EST-aware timestamp."""
+    df = pd.read_csv(path, parse_dates=["timestamp_est"])
+    required = {"timestamp_est", "open", "high", "low", "close", "volume"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
-
-    df = df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True)
-    df = df.sort_values("timestamp").set_index("timestamp")
-    return df[["open", "high", "low", "close", "volume"]]
-
-
-def build_hourly_contracts(
-    minute_df: pd.DataFrame,
-    trade_minute_est: int = 58,
-    horizon_minutes: int = 2,
-    timezone: str = "America/New_York",
-) -> pd.DataFrame:
-    """Construct hourly contracts from 1-minute candles.
-
-    Contract convention:
-    - Trade every hour at EST minute `trade_minute_est` (default :58).
-    - Settle at the next whole hour mark: trade_time + horizon_minutes (default 2).
-      Example: bet placed at 9:58 settles at 10:00.
-    - anchor_price: close at exactly 1h before settlement (e.g. 9:00 close for
-      a 10:00 contract). Used to derive a "nice" strike price.
-    - contract_return_log: log(settle_price / trade_price).
-
-    Returns a DataFrame with one row per valid contract.
-    """
-    if minute_df.index.tz is None:
-        raise ValueError("minute_df index must be timezone-aware")
-
-    work = minute_df.copy()
-    work["ts_est"] = work.index.tz_convert(timezone)
-    work["minute_est"] = work["ts_est"].dt.minute
-
-    entries = work[work["minute_est"] == trade_minute_est][["close", "ts_est"]].copy()
-    entries = entries.rename(columns={"close": "trade_price", "ts_est": "trade_time_est"})
-    entries["settle_time_utc"] = entries.index + pd.Timedelta(minutes=horizon_minutes)
-
-    close_px = work[["close"]]
-    settle_px = close_px.rename(columns={"close": "settle_price"})
-    merged = entries.merge(settle_px, left_on="settle_time_utc", right_index=True, how="inner")
-
-    # Anchor price: close at 1h before settlement (for "nice" strike derivation).
-    anchor_time = merged["settle_time_utc"] - pd.Timedelta(hours=1)
-    anchor_px = close_px.rename(columns={"close": "anchor_price"})
-    merged = merged.merge(anchor_px, left_on=anchor_time, right_index=True, how="left")
-    merged["anchor_price"] = merged["anchor_price"].fillna(merged["trade_price"])
-
-    merged["contract_return_log"] = np.log(merged["settle_price"] / merged["trade_price"])
-    merged["settle_time_est"] = merged["settle_time_utc"].dt.tz_convert(timezone)
-    # Label the contract by its settlement hour (e.g. 10:00 for the 9:58 bet).
-    merged["contract_hour_est"] = merged["settle_time_est"].dt.floor("h")
-
-    out_cols = [
-        "trade_time_est",
-        "settle_time_est",
-        "contract_hour_est",
-        "anchor_price",
-        "trade_price",
-        "settle_price",
-        "contract_return_log",
-    ]
-    return merged[out_cols].reset_index(drop=True)
+    return df.sort_values("timestamp_est").set_index("timestamp_est")[["open", "high", "low", "close", "volume"]]
 
 
 def calibrate_gbm_from_log_returns(log_returns: pd.Series | np.ndarray, dt_hours: float = 1.0) -> GBMParams:
@@ -250,434 +173,161 @@ def student_t_binary_prob(
     return p_above if direction == "above" else float(1.0 - p_above)
 
 
-def _contract_horizon_hours(contracts: pd.DataFrame) -> float:
-    """Infer contract duration in hours from the first data row."""
-    row = contracts.iloc[0]
-    return (row["settle_time_est"] - row["trade_time_est"]).total_seconds() / 3600.0
+def _minute_log_returns_before(
+    minute_df: pd.DataFrame,
+    before_time,
+    lookback_hours: float,
+) -> np.ndarray:
+    """1-minute log-returns in the window (before_time - lookback_hours, before_time)."""
+    start = before_time - pd.Timedelta(hours=lookback_hours)
+    closes = minute_df.loc[
+        (minute_df.index > start) & (minute_df.index < before_time), "close"
+    ].dropna()
+    if len(closes) < 2:
+        return np.array([])
+    return np.log(closes.values[1:] / closes.values[:-1])
 
 
-def walkforward_hourly_probabilities(
-    contracts: pd.DataFrame,
-    lookback_contracts: int = 72,
-    strike_mode: Literal["atm", "pct"] = "atm",
-    strike_pct: float = 0.0,
-    n_sims_t: int = 20_000,
-) -> pd.DataFrame:
-    """Run rolling calibration and produce hourly probabilities.
+# ---------------------------------------------------------------------------
+# Event-based fair value (Gemini prediction market — multi-hour/day contracts)
+# ---------------------------------------------------------------------------
 
-    - Each row is a tradeable hourly contract.
-    - Uses prior `lookback_contracts` realized contracts to calibrate models.
-    - `strike_mode='atm'`: strike = trade_price.
-    - `strike_mode='pct'`: strike = trade_price * (1 + strike_pct).
+_EVENT_TICKER_RE = re.compile(
+    r"^(?P<asset>BTC|ETH|SOL)(?P<yy>\d{2})(?P<mm>\d{2})(?P<dd>\d{2})(?P<hh>\d{2})(?P<mn>\d{2})$"
+)
 
-    dt_hours is inferred from the contract settle/trade times so GBMParams
-    carry correct hourly units (e.g. sigma_per_sqrt_hour ≈ 0.39% for BTC,
-    not the mislabeled 0.07% that results from using dt=1 on 2-min returns).
+
+def parse_event_ticker(ticker: str) -> tuple[str, datetime] | tuple[None, None]:
+    """Parse a Gemini prediction market ticker into (asset, settle_time_utc).
+
+    Ticker format: {ASSET}{YY}{MM}{DD}{HH}{MN}
+    Example: BTC2603022300 → ('BTC', datetime(2026,3,2,23,0, tzinfo=UTC))
+    Returns (None, None) if the ticker doesn't match.
     """
-    dt_hours = _contract_horizon_hours(contracts)
-    df = contracts.copy().reset_index(drop=True)
-    out_rows = []
-
-    for i in range(lookback_contracts, len(df)):
-        hist = df.iloc[i - lookback_contracts : i]
-        now = df.iloc[i]
-
-        gbm = calibrate_gbm_from_log_returns(hist["contract_return_log"].values, dt_hours=dt_hours)
-        tpar = calibrate_student_t_from_log_returns(hist["contract_return_log"].values)
-
-        trade_px = float(now["trade_price"])
-        if strike_mode == "atm":
-            strike = trade_px
-        else:
-            strike = trade_px * (1.0 + strike_pct)
-
-        p_gbm = gbm_binary_prob(trade_px, strike, gbm, horizon_hours=dt_hours, direction="above")
-        p_t = student_t_binary_prob(
-            trade_px,
-            strike,
-            tpar,
-            direction="above",
-            n_sims=n_sims_t,
-            seed=17 + i,
-        )
-
-        realized = float(now["settle_price"] > strike)
-        out_rows.append(
-            {
-                "trade_time_est": now["trade_time_est"],
-                "settle_time_est": now["settle_time_est"],
-                "trade_price": trade_px,
-                "strike": strike,
-                "settle_price": float(now["settle_price"]),
-                "realized_above": realized,
-                "p_above_gbm": p_gbm,
-                "p_above_student_t": p_t,
-                "mu_per_hour": gbm.mu_per_hour,
-                "sigma_per_sqrt_hour": gbm.sigma_per_sqrt_hour,
-                "t_loc": tpar.loc,
-                "t_scale": tpar.scale,
-                "t_nu": tpar.nu,
-            }
-        )
-
-    return pd.DataFrame(out_rows)
+    m = _EVENT_TICKER_RE.match(ticker)
+    if not m:
+        return None, None
+    g = m.groupdict()
+    settle = datetime(
+        2000 + int(g["yy"]), int(g["mm"]), int(g["dd"]),
+        int(g["hh"]), int(g["mn"]), tzinfo=timezone.utc,
+    )
+    return g["asset"], settle
 
 
-def model_summary_table(preds: pd.DataFrame) -> pd.DataFrame:
-    """Simple diagnostics for probability quality."""
-    if preds.empty:
+def compute_event_fair_value(
+    spot: float,
+    strike: float,
+    settle_time_utc: datetime,
+    minute_df: pd.DataFrame,
+    eval_time: pd.Timestamp | None = None,
+    lookback_hours: float = 48.0,
+    direction: Direction = "above",
+) -> dict | None:
+    """GBM fair value for a live Gemini prediction market contract.
+
+    Can be called at any point during the contract's life, not just at entry.
+
+    Parameters
+    ----------
+    spot            : Current underlying price S_t.
+    strike          : Contract strike K.
+    settle_time_utc : Contract settlement datetime (UTC-aware).
+    minute_df       : 1-minute OHLCV with EST-aware DatetimeIndex.
+    eval_time       : Evaluation timestamp (defaults to latest bar in minute_df).
+    lookback_hours  : Window for vol calibration (no look-ahead; only bars < eval_time).
+    direction       : "above" → P(S_T > K); "below" → P(S_T < K).
+
+    Returns dict with fair value and diagnostics, or None if insufficient data.
+    """
+    if eval_time is None:
+        eval_time = minute_df.index[-1]
+
+    # Convert settle_time to same tz as minute_df index
+    settle_est = pd.Timestamp(settle_time_utc).tz_convert(minute_df.index.tz)
+    horizon_hours = (settle_est - eval_time).total_seconds() / 3600.0
+
+    if horizon_hours <= 0:
+        # Contract already settled
+        realized = float(spot > strike) if direction == "above" else float(spot <= strike)
+        return {"p_fair_gbm": realized, "horizon_hours": 0.0, "sigma_annual": None}
+
+    min_lr = _minute_log_returns_before(minute_df, eval_time, lookback_hours)
+    if len(min_lr) < 20:
+        return None
+
+    gbm = calibrate_gbm_from_log_returns(min_lr, dt_hours=1 / 60)
+    p_fair = gbm_binary_prob(spot, strike, gbm, horizon_hours=horizon_hours, direction=direction)
+    sigma_annual = gbm.sigma_per_sqrt_hour * sqrt(8_760)  # annualised vol
+
+    return {
+        "eval_time": eval_time,
+        "settle_time_est": settle_est,
+        "horizon_hours": horizon_hours,
+        "S_t": spot,
+        "strike": strike,
+        "direction": direction,
+        "sigma_annual": sigma_annual,
+        "p_fair_gbm": p_fair,
+    }
+
+
+def compute_fair_value_path(
+    minute_df: pd.DataFrame,
+    strike: float,
+    settle_time_utc: datetime,
+    lookback_hours: float = 48.0,
+    contract_life_hours: float = 24.0,
+    direction: Direction = "above",
+) -> pd.DataFrame:
+    """Compute GBM fair value at every minute during a contract's life.
+
+    Used for backtesting: compare p_fair_gbm column against p_market (from
+    getdata_prediction_contract.py recordings) to measure and validate edge.
+
+    Parameters
+    ----------
+    minute_df           : 1-minute OHLCV (EST-aware index).
+    strike              : Contract strike K.
+    settle_time_utc     : Settlement time (UTC-aware datetime).
+    lookback_hours      : Rolling calibration window (strictly before each bar).
+    contract_life_hours : How far back from settle_time the contract was listed.
+    direction           : "above" or "below".
+
+    Returns
+    -------
+    DataFrame with one row per minute. Key columns:
+        t, horizon_hours, S_t, strike, p_fair_gbm, realized_above, sigma_annual
+    """
+    settle_est = pd.Timestamp(settle_time_utc).tz_convert(minute_df.index.tz)
+    start_est = settle_est - pd.Timedelta(hours=contract_life_hours)
+
+    life_bars = minute_df.loc[
+        (minute_df.index >= start_est) & (minute_df.index < settle_est)
+    ]
+    if life_bars.empty:
         return pd.DataFrame()
 
-    y = preds["realized_above"].to_numpy(dtype=float)
-    p_g = np.clip(preds["p_above_gbm"].to_numpy(dtype=float), 1e-6, 1 - 1e-6)
-    p_t = np.clip(preds["p_above_student_t"].to_numpy(dtype=float), 1e-6, 1 - 1e-6)
-
-    def brier(p: np.ndarray) -> float:
-        return float(np.mean((p - y) ** 2))
-
-    def logloss(p: np.ndarray) -> float:
-        return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
-
-    return pd.DataFrame(
-        [
-            {
-                "model": "gbm",
-                "brier": brier(p_g),
-                "logloss": logloss(p_g),
-                "mean_prob": float(np.mean(p_g)),
-            },
-            {
-                "model": "student_t",
-                "brier": brier(p_t),
-                "logloss": logloss(p_t),
-                "mean_prob": float(np.mean(p_t)),
-            },
-        ]
-    )
-
-
-def evaluate_latest_three_strikes(
-    contracts: pd.DataFrame,
-    lookback_contracts: int = 24,
-    spacing: float = 250.0,
-    n_sims_t: int = 20_000,
-) -> pd.DataFrame:
-    """Evaluate 3 strike contracts for the latest tradeable hour."""
-    if len(contracts) < lookback_contracts + 1:
-        raise ValueError("Not enough contracts for requested lookback")
-
-    dt_hours = _contract_horizon_hours(contracts)
-    hist = contracts.iloc[-(lookback_contracts + 1) : -1]
-    now = contracts.iloc[-1]
-
-    gbm = calibrate_gbm_from_log_returns(hist["contract_return_log"].values, dt_hours=dt_hours)
-    tpar = calibrate_student_t_from_log_returns(hist["contract_return_log"].values)
-
-    trade_price = float(now["trade_price"])
-    settle_price = float(now["settle_price"])
-    # Anchor strikes on the close price 1h before settlement (stored in anchor_price).
-    anchor_price_1h_ago = float(now["anchor_price"])
-    strikes = three_contract_strikes_from_anchor(anchor_price_1h_ago, spacing=spacing)
+    # Terminal price for realized outcome (last bar at or before settle)
+    bars_at_or_before_settle = minute_df.loc[minute_df.index <= settle_est]
+    sT = float(bars_at_or_before_settle["close"].iloc[-1]) if not bars_at_or_before_settle.empty else float("nan")
+    realized = float(sT > strike) if direction == "above" else float(sT <= strike)
 
     rows = []
-    for i, strike in enumerate(strikes):
-        p_gbm = gbm_binary_prob(trade_price, strike, gbm, horizon_hours=dt_hours, direction="above")
-        p_t = student_t_binary_prob(
-            trade_price,
-            strike,
-            tpar,
-            direction="above",
-            n_sims=n_sims_t,
-            seed=100 + i,
+    for t, bar in life_bars.iterrows():
+        result = compute_event_fair_value(
+            spot=float(bar["close"]),
+            strike=strike,
+            settle_time_utc=settle_time_utc,
+            minute_df=minute_df,
+            eval_time=t,
+            lookback_hours=lookback_hours,
+            direction=direction,
         )
-        realized = float(settle_price > strike)
-        pred_gbm = float(p_gbm >= 0.5)
-        pred_t = float(p_t >= 0.5)
-        rows.append(
-            {
-                "contract": f"BTC > ${strike:,.0f}",
-                "trade_time_est": now["trade_time_est"],
-                "settle_time_est": now["settle_time_est"],
-                "trade_price": trade_price,
-                "anchor_price_1h_ago": anchor_price_1h_ago,
-                "settle_price": settle_price,
-                "strike": strike,
-                "p_above_gbm": p_gbm,
-                "p_above_student_t": p_t,
-                "actual_result": "YES" if realized == 1.0 else "NO",
-                "gbm_prediction": "YES" if pred_gbm == 1.0 else "NO",
-                "student_t_prediction": "YES" if pred_t == 1.0 else "NO",
-                "gbm_correct": bool(pred_gbm == realized),
-                "student_t_correct": bool(pred_t == realized),
-            }
-        )
+        if result is None:
+            continue
+        result["sT"] = sT
+        result["realized"] = realized
+        rows.append(result)
 
     return pd.DataFrame(rows)
-
-
-def walkforward_three_strikes(
-    contracts: pd.DataFrame,
-    lookback_contracts: int = 72,
-    spacing: float = 250.0,
-    n_sims_t: int = 20_000,
-) -> pd.DataFrame:
-    """Walk-forward over ALL contracts, pricing the 3 anchor-based strikes each hour.
-
-    Unlike evaluate_latest_three_strikes (which only looks at the last row),
-    this iterates every contract after the warmup period so accuracy can be
-    measured across the full history.
-
-    Returns one row per (contract × strike):  3 rows per hourly slot.
-    """
-    dt_hours = _contract_horizon_hours(contracts)
-    df = contracts.copy().reset_index(drop=True)
-    out_rows = []
-
-    for i in range(lookback_contracts, len(df)):
-        hist = df.iloc[i - lookback_contracts : i]
-        now = df.iloc[i]
-
-        gbm = calibrate_gbm_from_log_returns(hist["contract_return_log"].values, dt_hours=dt_hours)
-        tpar = calibrate_student_t_from_log_returns(hist["contract_return_log"].values)
-
-        trade_px = float(now["trade_price"])
-        settle_px = float(now["settle_price"])
-        anchor_px = float(now["anchor_price"])
-        strikes = three_contract_strikes_from_anchor(anchor_px, spacing=spacing)
-
-        for rank, strike in enumerate(strikes):  # 0=high, 1=mid, 2=low
-            p_gbm = gbm_binary_prob(trade_px, strike, gbm, horizon_hours=dt_hours, direction="above")
-            p_t = student_t_binary_prob(
-                trade_px, strike, tpar, direction="above",
-                n_sims=n_sims_t, seed=i * 3 + rank,
-            )
-            realized = float(settle_px > strike)
-            pred_gbm = float(p_gbm >= 0.5)
-            pred_t = float(p_t >= 0.5)
-            out_rows.append({
-                "trade_time_est": now["trade_time_est"],
-                "settle_time_est": now["settle_time_est"],
-                "contract_hour_est": now["contract_hour_est"],
-                "strike_rank": rank,
-                "anchor_price": anchor_px,
-                "strike": strike,
-                "trade_price": trade_px,
-                "settle_price": settle_px,
-                "realized_above": realized,
-                "p_above_gbm": p_gbm,
-                "p_above_student_t": p_t,
-                "gbm_correct": bool(pred_gbm == realized),
-                "student_t_correct": bool(pred_t == realized),
-            })
-
-    return pd.DataFrame(out_rows)
-
-
-def three_strike_accuracy_table(preds: pd.DataFrame) -> pd.DataFrame:
-    """Accuracy breakdown by strike level (high/mid/low), overall, and contested.
-
-    'contested' filters to predictions where GBM gives 0.2 < p < 0.8 — cases
-    where the model is genuinely uncertain. High/low accuracy is almost always
-    inflated by deep OTM strikes that are trivially predictable.
-    """
-    if preds.empty:
-        return pd.DataFrame()
-
-    rank_labels = {0: "high", 1: "mid", 2: "low"}
-    rows = []
-    for rank, label in [(-1, "overall")] + list(rank_labels.items()):
-        sub = preds if rank == -1 else preds[preds["strike_rank"] == rank]
-        if sub.empty:
-            continue
-        n_hours = len(sub) // 3 if label == "overall" else len(sub)
-        for model, col in [("gbm", "gbm_correct"), ("student_t", "student_t_correct")]:
-            rows.append({
-                "strike_level": label,
-                "model": model,
-                "accuracy": float(sub[col].mean()),
-                "n": n_hours,
-            })
-
-    # Contested: where GBM assigns genuine uncertainty (not near 0 or 1).
-    contested = preds[(preds["p_above_gbm"] > 0.2) & (preds["p_above_gbm"] < 0.8)]
-    if not contested.empty:
-        for model, col in [("gbm", "gbm_correct"), ("student_t", "student_t_correct")]:
-            rows.append({
-                "strike_level": "contested(0.2<p<0.8)",
-                "model": model,
-                "accuracy": float(contested[col].mean()),
-                "n": len(contested),
-            })
-
-    return pd.DataFrame(rows)
-
-
-def classification_accuracy_table(preds: pd.DataFrame) -> pd.DataFrame:
-    """Return overall directional accuracy for each method."""
-    if preds.empty:
-        return pd.DataFrame()
-
-    y = preds["realized_above"].to_numpy(dtype=float)
-    gbm_pred = (preds["p_above_gbm"].to_numpy(dtype=float) >= 0.5).astype(float)
-    t_pred = (preds["p_above_student_t"].to_numpy(dtype=float) >= 0.5).astype(float)
-
-    return pd.DataFrame(
-        [
-            {
-                "method": "gbm",
-                "accuracy": float(np.mean(gbm_pred == y)),
-                "n_predictions": int(len(y)),
-            },
-            {
-                "method": "student_t",
-                "accuracy": float(np.mean(t_pred == y)),
-                "n_predictions": int(len(y)),
-            },
-        ]
-    )
-
-
-def build_ml_feature_table(contracts: pd.DataFrame, n_lags: int = 6) -> pd.DataFrame:
-    """Create a supervised table for distributional ML on hourly contracts.
-
-    Features:
-    - Lagged hourly log returns (1..n_lags)
-    - Lagged hourly volume z-score
-    - Hour-of-day cyclical encoding (EST)
-    """
-    df = contracts.copy().sort_values("trade_time_est").reset_index(drop=True)
-    df["hour_est"] = df["trade_time_est"].dt.hour
-
-    for lag in range(1, n_lags + 1):
-        df[f"ret_lag_{lag}"] = df["contract_return_log"].shift(lag)
-
-    vol = np.log(df["trade_price"]).diff().abs().fillna(0.0)
-    vol_rolling = vol.rolling(24, min_periods=8).std()
-    df["vol_z"] = (vol - vol.rolling(24, min_periods=8).mean()) / vol_rolling.replace(0, np.nan)
-    df["vol_z"] = df["vol_z"].fillna(0.0)
-
-    df["hour_sin"] = np.sin(2 * np.pi * df["hour_est"] / 24.0)
-    df["hour_cos"] = np.cos(2 * np.pi * df["hour_est"] / 24.0)
-
-    return df
-
-
-def _fit_ols(X: np.ndarray, y: np.ndarray, ridge: float = 1e-6) -> np.ndarray:
-    """Stable closed-form linear regression with small ridge regularization."""
-    xtx = X.T @ X
-    n = xtx.shape[0]
-    return np.linalg.solve(xtx + ridge * np.eye(n), X.T @ y)
-
-
-def fit_distributional_linear_model(train_df: pd.DataFrame, n_lags: int = 6) -> DistLinearModel:
-    """Fit mean and variance linear heads for conditional return distribution."""
-    feature_cols = [f"ret_lag_{i}" for i in range(1, n_lags + 1)] + ["vol_z", "hour_sin", "hour_cos"]
-    work = train_df.dropna(subset=feature_cols + ["contract_return_log"]).copy()
-    if len(work) < 20:
-        raise ValueError("Need at least 20 rows to fit distributional linear model")
-
-    X = work[feature_cols].to_numpy(dtype=float)
-    X = np.column_stack([np.ones(len(X)), X])
-    y = work["contract_return_log"].to_numpy(dtype=float)
-
-    beta_mean = _fit_ols(X, y)
-    resid = y - X @ beta_mean
-    # Fit log variance on squared residuals.
-    y_var = np.log(np.maximum(resid * resid, 1e-12))
-    beta_log_var = _fit_ols(X, y_var)
-
-    return DistLinearModel(feature_cols=feature_cols, beta_mean=beta_mean, beta_log_var=beta_log_var)
-
-
-def predict_distributional_linear(model: DistLinearModel, feature_df: pd.DataFrame) -> pd.DataFrame:
-    """Predict conditional mean and std for hourly log returns."""
-    work = feature_df.copy()
-    X = work[model.feature_cols].to_numpy(dtype=float)
-    X = np.column_stack([np.ones(len(X)), X])
-
-    mu = X @ model.beta_mean
-    log_var = X @ model.beta_log_var
-    sigma = np.sqrt(np.maximum(np.exp(log_var), 1e-12))
-
-    out = pd.DataFrame(index=work.index)
-    out["mu_logret"] = mu
-    out["sigma_logret"] = sigma
-    return out
-
-
-def run_example(
-    data_path: str | Path = ".data/gemini/ohlcv_1m_7d/btcusd.data",
-    lookback_contracts: int = 24,
-    spacing: float = 250.0,
-    output_path: Optional[str | Path] = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Convenience entrypoint for notebook/CLI use.
-
-    Returns (contracts, atm_preds, summary, three_strike_preds).
-    If output_path is given, three_strike_preds is saved as CSV there.
-    """
-    minute = load_gemini_ohlcv(data_path)
-    contracts = build_hourly_contracts(minute)
-    if len(contracts) <= lookback_contracts:
-        lookback_contracts = max(10, len(contracts) // 2)
-    preds = walkforward_hourly_probabilities(contracts, lookback_contracts=lookback_contracts)
-    summary = model_summary_table(preds)
-    preds_3s = walkforward_three_strikes(contracts, lookback_contracts=lookback_contracts, spacing=spacing)
-    if output_path is not None:
-        out = Path(output_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        preds_3s.to_csv(out, index=False)
-        print(f"  Saved → {out}")
-    return contracts, preds, summary, preds_3s
-
-
-# Spacings are set to roughly 1 standard deviation of each asset's 2-minute
-# price move, so strikes are genuinely contested for model evaluation:
-#   BTC ~1σ_2min = $80  → $100
-#   ETH ~1σ_2min = $2.63 → $3
-#   SOL ~1σ_2min = $0.13 → $0.10
-# (The actual Gemini market grid is $250 / $20 / $1; use those for live trading.)
-_SYMBOL_SPACING: dict[str, float] = {
-    "btcusd": 100.0,
-    "ethusd": 3.0,
-    "solusd": 0.10,
-}
-
-
-if __name__ == "__main__":
-    DATA_ROOT = Path(".data/gemini/ohlcv_1m_7d")
-    OUTPUT_ROOT = Path("./output")
-    LOOKBACK = 72  # ~3 days of hourly contracts
-
-    for symbol, spacing in _SYMBOL_SPACING.items():
-        data_path = DATA_ROOT / f"{symbol}.data"
-        if not data_path.exists():
-            print(f"[{symbol}] data file not found, skipping.")
-            continue
-
-        print(f"\n{'=' * 60}")
-        print(f"  {symbol.upper()}  (strike spacing ±{spacing})")
-        print(f"{'=' * 60}")
-
-        out_path = OUTPUT_ROOT / f"{symbol}_predictions.csv"
-        contracts_df, preds_df, summary_df, preds_3s = run_example(
-            data_path=data_path,
-            lookback_contracts=LOOKBACK,
-            spacing=spacing,
-            output_path=out_path,
-        )
-
-        print(f"  Contracts available: {len(contracts_df)}")
-        print(f"  Walk-forward rows  : {len(preds_3s)}  ({len(preds_3s) // 3} hours × 3 strikes)")
-
-        if not preds_3s.empty:
-            print("\nAccuracy by strike level:")
-            print(three_strike_accuracy_table(preds_3s).to_string(index=False))
-
-        if not preds_df.empty:
-            print("\nLatest 5 ATM predictions:")
-            atm_cols = [
-                "trade_time_est", "trade_price", "strike",
-                "p_above_gbm", "p_above_student_t", "realized_above",
-            ]
-            print(preds_df[atm_cols].tail(5).to_string(index=False))
