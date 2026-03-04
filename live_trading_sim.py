@@ -77,6 +77,12 @@ import pandas as pd
 import requests
 
 import config_loader as cfg
+
+try:
+    from gemini_trader import GeminiTrader
+except ImportError:
+    GeminiTrader = None  # type: ignore[assignment,misc]
+
 from btc_hourly_model import (
     StudentTParams,
     _minute_log_returns_before,
@@ -129,6 +135,8 @@ TRADE_FIELDS = [
     "outcome",        # YES_WIN | NO_WIN (settlement only)
     "pnl",            # realised P&L per $1 notional
     "status",         # open | settled | exited_early
+    "gemini_order_id",      # buy order ID (empty when simulation)
+    "n_contracts_filled",   # contracts actually filled by IOC buy (0 when simulation)
 ]
 
 PERF_LEDGER_FIELDS = [
@@ -155,7 +163,6 @@ EDGE_FIELDS = [
     "spot",
     "ask_yes",
     "ask_no",
-    "arb_long",
     # GBM (rolling-window sigma)
     "sigma_annual_gbm",
     "p_fair_gbm",   "edge_yes_gbm",   "edge_no_gbm",
@@ -551,6 +558,10 @@ def _create_position(
         "outcome":                  None,
         "pnl":                      None,
         "status":                   "open",
+        "gemini_order_id":          "",    # filled when placing real orders
+        "n_contracts_filled":       0,     # contracts still held (decrements on partial sell)
+        "n_contracts_original":     0,     # original fill count; never changes after BUY
+        "partial_realized_pnl":     0.0,   # accumulated per-unit PnL from partial sells
     }
 
 
@@ -579,6 +590,18 @@ def _check_early_exit(
     """
     if latest_row is None:
         return None
+
+    # If the contract has already passed its settlement time, do NOT fire
+    # early-exit signals — let _try_settle() handle it once OHLCV updates.
+    # Without this guard, profit_lock / stop_loss can close the position via
+    # the stale bid (e.g. bid→1.0 on a won contract) before settlement runs,
+    # recording a sub-optimal exit_bid instead of the true settlement value.
+    try:
+        settle_time_utc = datetime.fromisoformat(pos["settle_time_utc"])
+        if now_utc >= settle_time_utc:
+            return None
+    except (KeyError, ValueError):
+        pass
 
     side      = pos["side"]
     ask_entry = float(pos["ask_price"])
@@ -649,7 +672,7 @@ def _check_early_exit(
                 # 4. Edge has completely closed (market repriced to model).
                 edge_key = f"edge_yes_{p_key}" if side == "YES" else f"edge_no_{p_key}"
                 current_edge = edges.get(edge_key)
-                if current_edge is not None and current_edge < 0:
+                if current_edge is not None and current_edge <= 0:
                     return {
                         "exit_reason": f"edge_closed({current_edge:.3f})",
                         "exit_bid":    bid_now,
@@ -662,12 +685,28 @@ def _check_early_exit(
 
 
 def _apply_early_exit(pos: dict, exit_info: dict, now_utc: datetime) -> None:
-    """Mutate pos with early-exit closing fields."""
+    """Mutate pos with early-exit closing fields.
+
+    Blends partial-sell PnL (from any prior IOC partial fills) with the
+    current exit PnL so the recorded figure reflects the true blended
+    per-unit return across both sell legs.
+    """
+    n_original = pos.get("n_contracts_original") or pos.get("n_contracts_filled") or 1
+    n_remaining = pos.get("n_contracts_filled", n_original)
+    partial_pnl = pos.get("partial_realized_pnl", 0.0)
+
+    exit_pnl = exit_info["exit_pnl"]
+    if partial_pnl and n_original > 0:
+        # Blend: (per-unit-gain-on-remaining * n_remaining + cumulative-partial) / n_original
+        blended = round((exit_pnl * n_remaining + partial_pnl) / n_original, 4)
+    else:
+        blended = exit_pnl
+
     pos.update({
         "exit_time_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S+00:00"),
         "exit_reason":   exit_info["exit_reason"],
         "exit_bid":      exit_info["exit_bid"],
-        "pnl":           exit_info["exit_pnl"],
+        "pnl":           blended,
         "status":        "exited_early",
     })
 
@@ -701,10 +740,19 @@ def _try_settle(pos: dict, minute_df: pd.DataFrame | None, now_utc: datetime) ->
     outcome = ("YES_WIN" if spot_at_settle > strike else "NO_WIN") if direction == "above" \
          else ("YES_WIN" if spot_at_settle <= strike else "NO_WIN")
 
-    ask_price = float(pos["ask_price"])
-    won       = (pos["side"] == "YES" and outcome == "YES_WIN") or \
-                (pos["side"] == "NO"  and outcome == "NO_WIN")
-    pnl       = round((1.0 - ask_price) if won else (-ask_price), 4)
+    ask_price   = float(pos["ask_price"])
+    won         = (pos["side"] == "YES" and outcome == "YES_WIN") or \
+                  (pos["side"] == "NO"  and outcome == "NO_WIN")
+    settle_pnl  = (1.0 - ask_price) if won else (-ask_price)
+
+    # Blend with any accumulated partial-sell PnL from prior IOC partial fills.
+    n_original  = pos.get("n_contracts_original") or pos.get("n_contracts_filled") or 1
+    n_remaining = pos.get("n_contracts_filled", n_original)
+    partial_pnl = pos.get("partial_realized_pnl", 0.0)
+    if partial_pnl and n_original > 0:
+        pnl = round((settle_pnl * n_remaining + partial_pnl) / n_original, 4)
+    else:
+        pnl = round(settle_pnl, 4)
 
     pos.update({
         "exit_time_utc":  now_utc.strftime("%Y-%m-%d %H:%M:%S+00:00"),
@@ -973,6 +1021,8 @@ def run(
     ewma_lambda:        float = 0.94,
     rho:                float = -0.5,
     no_collectors:      bool  = False,
+    trader=None,        # GeminiTrader | None  — None = simulation only
+    active_models:      set | None = None,  # restrict entry to these models; None = all 6
 ) -> None:
     """Poll contract data, calibrate all 6 models, simulate trades, manage exits."""
     _lb_defaults = {"gbm": 24.0, "ewma": 48.0, "garch": 72.0,
@@ -1028,6 +1078,9 @@ def run(
     seen_stud:   set[str] = set()
     seen_skt:    set[str] = set()
     seen_heston: set[str] = set()
+    # Contracts that have had their edge signal logged (once per contract per session).
+    # Independent of model selection so edge log is written regardless of active_models.
+    edge_seen: set[str] = set()
     # Maps model name → its seen_set so closed positions can be removed,
     # allowing re-entry if a new edge appears on the same contract later.
     seen_by_model: dict[str, set[str]] = {
@@ -1105,6 +1158,54 @@ def run(
                         exit_info["exit_pnl"] = round(
                             fresh_bid - float(pos["ask_price"]), 4
                         )
+                # ── Live sell order (only when we actually hold contracts) ────
+                if trader is not None:
+                    n_held = pos.get("n_contracts_filled", 0)
+                    if n_held > 0:
+                        # Use exit_bid directly — it is always set by _check_early_exit
+                        # (and possibly refreshed by live quote above).  Do NOT use
+                        # "or float(pos['ask_price'])" — that silently replaces a
+                        # legitimate 0.0 bid with the entry ask.
+                        sell_bid = exit_info["exit_bid"]
+                        try:
+                            sell = trader.sell_order(
+                                contract_id = pos["contract_id"],
+                                side        = pos["side"],
+                                bid_price   = sell_bid,
+                                n_contracts = n_held,
+                            )
+                            if sell["filled"] < n_held:
+                                # Partial IOC fill — unsold contracts remain open.
+                                # Accumulate per-unit realized PnL for the sold portion
+                                # so the final close can blend both parts correctly.
+                                remaining = n_held - sell["filled"]
+                                per_unit_gain = sell_bid - float(pos["ask_price"])
+                                pos["partial_realized_pnl"] = (
+                                    pos.get("partial_realized_pnl", 0.0)
+                                    + per_unit_gain * sell["filled"]
+                                )
+                                pos["n_contracts_filled"] = remaining
+                                print(
+                                    f"    [SELL]  PARTIAL FILL — sold {sell['filled']}"
+                                    f"/{n_held} contracts. "
+                                    f"{remaining} remain open; retrying next poll."
+                                )
+                                still_open.append(pos)
+                                continue  # skip _apply_early_exit — position not fully closed
+                            else:
+                                print(
+                                    f"    [SELL]  order_id={sell['order_id']}  "
+                                    f"filled={sell['filled']}/{sell['n_contracts']}  "
+                                    f"status={sell['status']}"
+                                )
+                        except Exception as exc:
+                            # Sell failed entirely — keep position open and retry next poll
+                            print(
+                                f"    [SELL]  FAILED: {exc} "
+                                f"— keeping position open for retry"
+                            )
+                            still_open.append(pos)
+                            continue
                 _apply_early_exit(pos, exit_info, now_utc)
                 closed_positions.append(pos)
                 _append_csv(trade_out, pos, TRADE_FIELDS)
@@ -1165,13 +1266,17 @@ def run(
             if current_hrs < 0 or current_hrs > max_hours_to_settle:
                 continue
 
-            need_gbm    = contract_id not in seen_gbm
-            need_ewma   = contract_id not in seen_ewma
-            need_garch  = contract_id not in seen_garch
-            need_stud   = contract_id not in seen_stud
-            need_skt    = contract_id not in seen_skt
-            need_heston = contract_id not in seen_heston
-            if not (need_gbm or need_ewma or need_garch or need_stud or need_skt or need_heston):
+            # need_X is False for inactive models so they don't prevent the outer
+            # skip guard from firing and don't force _compute_edges on every poll.
+            _am = active_models
+            need_gbm    = (contract_id not in seen_gbm)    and (_am is None or "gbm"       in _am)
+            need_ewma   = (contract_id not in seen_ewma)   and (_am is None or "ewma"      in _am)
+            need_garch  = (contract_id not in seen_garch)  and (_am is None or "garch"     in _am)
+            need_stud   = (contract_id not in seen_stud)   and (_am is None or "student_t" in _am)
+            need_skt    = (contract_id not in seen_skt)    and (_am is None or "skewed_t"  in _am)
+            need_heston = (contract_id not in seen_heston) and (_am is None or "heston"    in _am)
+            need_edge   = contract_id not in edge_seen  # edge log independent of model filter
+            if not (need_gbm or need_ewma or need_garch or need_stud or need_skt or need_heston or need_edge):
                 continue
 
             edges = _compute_edges(
@@ -1189,8 +1294,8 @@ def run(
                 rho             = rho,
             )
 
-            if need_gbm:  # log edge signals once per contract (all models in one row)
-                arb_long = round(ask_yes + ask_no - 1.0, 4) if (ask_yes and ask_no) else None
+            if need_edge:  # log edge signals once per contract (all models in one row)
+                edge_seen.add(contract_id)
                 _append_csv(edge_out, {
                     "timestamp_utc":      row["timestamp_utc"],
                     "contract_id":        contract_id,
@@ -1201,7 +1306,6 @@ def run(
                     "spot":               edges["spot"]               if edges else None,
                     "ask_yes":            ask_yes,
                     "ask_no":             ask_no,
-                    "arb_long":           arb_long,
                     # GBM
                     "sigma_annual_gbm":   edges["sigma_annual_gbm"]   if edges else None,
                     "p_fair_gbm":         edges["p_fair_gbm"]         if edges else None,
@@ -1253,10 +1357,16 @@ def run(
             ]:
                 if not needed:
                     continue  # already evaluated for this model
+                if active_models is not None and model_name not in active_models:
+                    continue  # model not selected for this run
                 if edges is None:
                     continue  # OHLCV stale or insufficient — retry next poll
 
-                seen_set.add(contract_id)
+                # NOTE: seen_set.add() is intentionally deferred until after a
+                # confirmed entry below.  Adding here would permanently blacklist
+                # contracts where no edge is found or where the live quote shows
+                # the edge has closed — preventing re-evaluation if the market
+                # reprices back into edge territory later in the session.
 
                 p_fair   = edges[f"p_fair_{p_key}"]
                 edge_yes = edges.get(f"edge_yes_{p_key}")
@@ -1271,7 +1381,7 @@ def run(
                     side, edge_val, ask_price, p_side = "NO", edge_no, ask_no, 1.0 - p_fair
 
                 if side is None:
-                    continue
+                    continue  # no edge — do NOT add to seen_set; re-evaluate next poll
 
                 # ── Live quote: re-validate edge at true execution price ──────
                 # The CSV ask may be up to 60s stale. Fetch the live order book
@@ -1284,9 +1394,13 @@ def run(
                     if fresh_ask is not None:
                         fresh_edge = round(p_side - fresh_ask, 4)
                         if fresh_edge <= min_edge:
-                            continue  # edge gone by execution time — skip
+                            continue  # edge gone — do NOT add to seen_set; re-evaluate next poll
                         ask_price = fresh_ask
                         edge_val  = fresh_edge
+                elif trader is not None:
+                    # Live trading mode: skip if we can't confirm the execution price.
+                    # Simulation mode (trader is None): fall through using CSV ask.
+                    continue
 
                 # Market mid for the side we're trading
                 mid_yes = _safe_float(row.get("mid_yes"))
@@ -1295,6 +1409,49 @@ def run(
 
                 pos = _create_position(row, model_name, side, ask_price, p_side,
                                        edge_val, market_mid, edges)
+
+                # ── Live order placement (only when trader is configured) ──────
+                # IMPORTANT: only add to open_positions AFTER a confirmed fill.
+                # A failed or zero-fill BUY means we hold nothing at the exchange.
+                if trader is not None:
+                    try:
+                        order = trader.place_order(
+                            contract_id = contract_id,
+                            side        = side,
+                            ask_price   = ask_price,
+                        )
+                        if order["filled"] == 0:
+                            # IOC with zero fill — no real position, allow retry next poll
+                            print(
+                                f"    [BUY]  IOC filled 0 contracts "
+                                f"(order_id={order['order_id']}) — skipping"
+                            )
+                            seen_set.discard(contract_id)
+                            continue
+                        pos["gemini_order_id"]      = str(order.get("order_id") or "")
+                        pos["n_contracts_filled"]   = order["filled"]
+                        pos["n_contracts_original"] = order["filled"]  # immutable reference count
+                        # Update entry basis to actual fill price if the API returns it.
+                        # This ensures profit_lock / stop_loss thresholds are anchored
+                        # to real executed cost, not the quoted ask.
+                        if order.get("avg_price") is not None:
+                            pos["ask_price"] = str(round(order["avg_price"], 4))
+                        print(
+                            f"    [BUY]  order_id={order['order_id']}  "
+                            f"requested={order['n_contracts']}  "
+                            f"filled={order['filled']}  "
+                            f"fill_price={pos['ask_price']}  status={order['status']}"
+                        )
+                    except Exception as exc:
+                        # Order failed entirely — discard so we can retry next poll
+                        print(f"    [BUY]  FAILED: {exc} — position not opened")
+                        seen_set.discard(contract_id)
+                        continue
+
+                # Mark as seen only after a confirmed entry so that contracts
+                # with no edge (or edge gone by execution) stay eligible for
+                # re-evaluation on future polls when the market reprices.
+                seen_set.add(contract_id)
                 open_positions.append(pos)
                 _log_enter(pos)
 
