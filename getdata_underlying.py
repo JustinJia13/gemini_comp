@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -125,11 +126,17 @@ def _append_rows(file_path: Path, rows: list) -> None:
 
 
 def _write_est_sidecar(source: Path) -> Path:
-    """Rewrite the full EST sidecar from the source file."""
+    """Rewrite the full EST sidecar from the source file.
+
+    Uses a write-to-temp + atomic rename pattern so the trading sim never
+    reads a partially written file.  os.replace() is POSIX-atomic on the
+    same filesystem, eliminating the truncate-then-rewrite race window.
+    """
     est_path = source.with_name(f"{source.stem}_est.data")
+    tmp_path = est_path.with_suffix(".tmp")
     tz = ZoneInfo(EST_TZ)
     with source.open("r", newline="") as f_in, \
-         est_path.open("w", newline="") as f_out:
+         tmp_path.open("w", newline="") as f_out:
         reader = csv.DictReader(f_in)
         fields = ["timestamp_ms", "timestamp_est", "open", "high", "low", "close", "volume"]
         writer = csv.DictWriter(f_out, fieldnames=fields)
@@ -146,6 +153,7 @@ def _write_est_sidecar(source: Path) -> Path:
                 "close":  row["close"],
                 "volume": row["volume"],
             })
+    os.replace(tmp_path, est_path)  # atomic on POSIX — sim never sees partial file
     return est_path
 
 

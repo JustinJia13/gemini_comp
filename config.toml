@@ -57,19 +57,19 @@ edge_neg_thresh  = 0.02     # edge_closed only fires when edge <= -this value
 # stability.  Each model's min_lr array is built independently so different
 # models can use different amounts of historical data.
 
-gbm    = 24.0    # rolling-window σ  — short window tracks intraday regime shifts
-ewma   = 48.0    # EWMA vol          — old data already exponentially down-weighted
-garch  = 72.0    # GARCH(1,1) MLE   — needs more bars for tight α, β estimates
-stud   = 48.0    # Student's t       — tail estimation stabilises around 48h
-skt    = 48.0    # Skewed t          — same window as student_t
-heston = 96.0    # Heston AR(1)      — needs many hourly realised-var windows for κ, ξ
-hybrid      = 48.0    # Hybrid EWMA-σ + Student-t — EWMA vol (responsive) + t-tail from standardised residuals
+gbm    = 12.0    # rolling-window σ  — 720 bars plenty; shorter tracks intraday regime
+ewma   = 24.0    # EWMA vol          — exp decay already weights recent; 1440 bars fine
+garch  = 48.0    # GARCH(1,1) MLE   — MLE stable at 2880 bars; was 72h
+stud   = 24.0    # Student's t       — ν identifiable from 1440 bars
+skt    = 24.0    # Skewed t          — same as student_t
+heston = 72.0    # Heston AR(1)      — needs hourly var time series; min 48h, keep 72h
+hybrid      = 24.0    # Hybrid EWMA-σ + Student-t — EWMA vol (responsive) + t-tail from standardised residuals
 ou          = 12.0    # OU on log-price — short window for local mean-reversion; AR(1) on 1-min closes
-heston_ewma = 96.0    # Heston EWMA-θ  — same window as heston; theta/kappa/xi from EWMA-smoothed hourly var
+heston_ewma = 72.0    # Heston EWMA-θ  — same window as heston; was 96h
 
-# Merton Jump-Diffusion variants — same lookbacks as their base models
-gbm_jump      = 24.0   # GBM + jump
-ewma_jump     = 48.0   # EWMA + jump
-garch_jump    = 72.0   # GARCH + jump
-student_t_jump= 48.0   # StudentT + jump
-hybrid_t_jump = 48.0   # HybridT + jump
+# Merton Jump-Diffusion variants
+gbm_jump      = 24.0   # GBM + jump    — min 24h to see ≥2-3 jumps for λ estimate
+ewma_jump     = 36.0   # EWMA + jump
+garch_jump    = 48.0   # GARCH + jump
+student_t_jump= 36.0   # StudentT + jump
+hybrid_t_jump = 36.0   # HybridT + jump

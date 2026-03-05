@@ -73,7 +73,7 @@ from datetime import datetime, timezone
 from math import sqrt
 from pathlib import Path
 from zoneinfo import ZoneInfo
-
+import numpy as np
 import pandas as pd
 import requests
 
@@ -222,16 +222,6 @@ EDGE_FIELDS = [
 
 def _today_str() -> str:
     return datetime.now(tz=timezone.utc).strftime("%Y%m%d")
-
-
-def _trade_out_path() -> Path:
-    SIM_ROOT.mkdir(parents=True, exist_ok=True)
-    return SIM_ROOT / f"trades_{_today_str()}.csv"
-
-
-def _edge_out_path() -> Path:
-    SIM_ROOT.mkdir(parents=True, exist_ok=True)
-    return SIM_ROOT / f"edge_log_{_today_str()}.csv"
 
 
 def _real_trade_out_path() -> Path:
@@ -590,49 +580,51 @@ def _compute_edges(
     lb_jump_stud    = lookbacks.get("student_t_jump",lb_stud)
     lb_jump_hybrid  = lookbacks.get("hybrid_t_jump", lb_hybrid)
 
-    def _merton(sigma_h, mu_h, lr_for_jumps):
-        """Helper: calibrate jumps from lr_for_jumps, then call merton_binary_prob."""
+    def _merton(mu_h, lr_for_jumps):
+        """Helper: calibrate jumps from lr_for_jumps, then call merton_binary_prob.
+
+        calibrate_jumps_from_log_returns returns jp.sigma_diff = diffusion-only
+        vol (after stripping identified jump returns). We use jp.sigma_diff as
+        sigma_diff — NOT the base model's total sigma — to avoid double-counting
+        jump variance. Merton: σ²_total = σ²_diff + λ*(μ_J² + σ_J²).
+        """
         try:
             jp = calibrate_jumps_from_log_returns(lr_for_jumps, dt_hours=1 / 60)
             if jp is None:
                 return None, None
             return merton_binary_prob(
                 spot, strike, direction, horizon_hours,
-                sigma_diff=sigma_h, mu_hourly=mu_h, jump_params=jp,
+                sigma_diff=jp.sigma_diff, mu_hourly=mu_h, jump_params=jp,
             ), jp
         except Exception:
             return None, None
 
     # GBM+Jump
-    _p_gbm_j, _jp_gbm = _merton(gbm.sigma_per_sqrt_hour, gbm.mu_per_hour, _get_lr(lb_jump))
+    _p_gbm_j, _jp_gbm = _merton(gbm.mu_per_hour, _get_lr(lb_jump))
     p_gbm_jump = _p_gbm_j if _p_gbm_j is not None else p_gbm
 
     # EWMA+Jump
     if ewma_par is not None:
-        _p_ewma_j, _jp_ewma = _merton(ewma_par.sigma_per_sqrt_hour, ewma_par.mu_per_hour, _get_lr(lb_jump_ewma))
+        _p_ewma_j, _jp_ewma = _merton(ewma_par.mu_per_hour, _get_lr(lb_jump_ewma))
     else:
         _p_ewma_j, _jp_ewma = None, None
     p_ewma_jump = _p_ewma_j if _p_ewma_j is not None else p_ewma
 
     # GARCH+Jump — use σ from GARCH forward vol (σ_per_sqrt_hour) if available
     if garch_par is not None:
-        _p_garch_j, _jp_garch = _merton(garch_par.sigma_per_sqrt_hour, garch_par.mu_per_hour, _get_lr(lb_jump_garch))
+        _p_garch_j, _jp_garch = _merton(garch_par.mu_per_hour, _get_lr(lb_jump_garch))
     else:
         _p_garch_j, _jp_garch = None, None
     p_garch_jump = _p_garch_j if _p_garch_j is not None else p_garch
 
-    # StudentT+Jump — σ from t-calibration (robust to outliers); Gaussian Merton pricing
-    # Note: explicit jump model partially replaces the fat-tail role of the t-distribution.
-    _stud_sigma_h = tpar_1m.scale * sqrt(60)   # convert 1-min scale to per-sqrt-hour
-    _stud_mu_h    = tpar_1m.loc   * 60         # 1-min loc to per-hour
-    _p_stud_j, _jp_stud = _merton(_stud_sigma_h, _stud_mu_h, _get_lr(lb_jump_stud))
+    # StudentT+Jump — drift from t-calibration; diffusion-only σ from jump calibration
+    _stud_mu_h = tpar_1m.loc * 60   # 1-min loc to per-hour
+    _p_stud_j, _jp_stud = _merton(_stud_mu_h, _get_lr(lb_jump_stud))
     p_stud_jump = _p_stud_j if _p_stud_j is not None else p_stud
 
-    # HybridT+Jump — EWMA σ (regime-responsive) + jump overlay
+    # HybridT+Jump — EWMA drift + jump overlay; diffusion-only σ from jump calibration
     if hybrid_par is not None:
-        _hyb_sigma_h = hybrid_par.sigma_per_sqrt_hour
-        _hyb_mu_h    = hybrid_par.mu_per_hour
-        _p_hyb_j, _jp_hyb = _merton(_hyb_sigma_h, _hyb_mu_h, _get_lr(lb_jump_hybrid))
+        _p_hyb_j, _jp_hyb = _merton(hybrid_par.mu_per_hour, _get_lr(lb_jump_hybrid))
     else:
         _p_hyb_j, _jp_hyb = None, None
     p_hybrid_jump = _p_hyb_j if _p_hyb_j is not None else p_hybrid
@@ -786,6 +778,8 @@ def _check_early_exit(
     ewma_lambda: float = 0.94,
     rho: float = -0.5,
     edge_neg_thresh: float = 0.0,
+    vol_veto_mult: float = 2.0,
+    precomputed_edges: dict | None = None,
 ) -> dict | None:
     """Check whether an open position should be closed before settlement.
 
@@ -849,20 +843,24 @@ def _check_early_exit(
             ask_yes         = _safe_float(latest_row.get("ask_yes"))
             ask_no          = _safe_float(latest_row.get("ask_no"))
 
-            edges = _compute_edges(
-                contract_id     = pos["contract_id"],
-                spot            = spot,
-                strike          = strike,
-                direction       = direction,
-                ask_yes         = ask_yes,
-                ask_no          = ask_no,
-                settle_time_utc = settle_time_utc,
-                eval_time_utc   = now_utc,
-                minute_df       = minute_df,
-                lookbacks       = lookbacks,
-                ewma_lambda     = ewma_lambda,
-                rho             = rho,
-            )
+            if precomputed_edges is not None:
+                edges = precomputed_edges
+            else:
+                edges = _compute_edges(
+                    contract_id     = pos["contract_id"],
+                    spot            = spot,
+                    strike          = strike,
+                    direction       = direction,
+                    ask_yes         = ask_yes,
+                    ask_no          = ask_no,
+                    settle_time_utc = settle_time_utc,
+                    eval_time_utc   = now_utc,
+                    minute_df       = minute_df,
+                    lookbacks       = lookbacks,
+                    ewma_lambda     = ewma_lambda,
+                    rho             = rho,
+                    vol_veto_mult   = vol_veto_mult,
+                )
 
             if edges is not None:
                 _p_key_map = {
@@ -998,10 +996,10 @@ def _try_settle(pos: dict, minute_df: pd.DataFrame | None, now_utc: datetime) ->
 # Performance ledger
 # ---------------------------------------------------------------------------
 
-def _update_performance_ledger() -> dict[str, dict]:
+def _update_performance_ledger(sim_root: Path = SIM_ROOT) -> dict[str, dict]:
     """Recompute and overwrite performance_ledger.csv from ALL historical trade files.
 
-    Reads every trades_*.csv in SIM_ROOT so the ledger accumulates across
+    Reads every trades_*.csv in sim_root so the ledger accumulates across
     days and model versions.  Old trade rows are never deleted — this is
     purely a derived aggregate view of the raw per-day files.
 
@@ -1010,9 +1008,9 @@ def _update_performance_ledger() -> dict[str, dict]:
 
     Returns a dict keyed by model name for in-memory use by _print_summary.
     """
-    SIM_ROOT.mkdir(parents=True, exist_ok=True)
+    sim_root.mkdir(parents=True, exist_ok=True)
     all_rows: list[dict] = []
-    for fp in sorted(SIM_ROOT.glob("trades_*.csv")):
+    for fp in sorted(sim_root.glob("trades_*.csv")):
         try:
             with fp.open(newline="") as f:
                 all_rows.extend(list(csv.DictReader(f)))
@@ -1071,7 +1069,7 @@ def _update_performance_ledger() -> dict[str, dict]:
             "as_of":             now_str,
         })
 
-    ledger_path = SIM_ROOT / "performance_ledger.csv"
+    ledger_path = sim_root / "performance_ledger.csv"
     with ledger_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=PERF_LEDGER_FIELDS)
         w.writeheader()
@@ -1380,13 +1378,14 @@ def run(
     no_collectors:      bool  = False,
     trader=None,        # GeminiTrader | None  — None = simulation only
     active_models:      set | None = None,  # restrict entry to these models; None = all 14
+    sim_root:           Path = SIM_ROOT,    # output directory for trades/ledger
 ) -> None:
     """Poll contract data, calibrate all 14 models, simulate trades, manage exits."""
-    _lb_defaults = {"gbm": 24.0, "ewma": 48.0, "garch": 72.0,
-                    "stud": 48.0, "skt": 48.0, "heston": 96.0,
-                    "hybrid": 48.0, "ou": 12.0, "heston_ewma": 96.0,
-                    "gbm_jump": 24.0, "ewma_jump": 48.0, "garch_jump": 72.0,
-                    "student_t_jump": 48.0, "hybrid_t_jump": 48.0}
+    _lb_defaults = {"gbm": 12.0, "ewma": 24.0, "garch": 48.0,
+                    "stud": 24.0, "skt": 24.0, "heston": 72.0,
+                    "hybrid": 24.0, "ou": 12.0, "heston_ewma": 72.0,
+                    "gbm_jump": 24.0, "ewma_jump": 36.0, "garch_jump": 48.0,
+                    "student_t_jump": 36.0, "hybrid_t_jump": 36.0}
     if lookbacks is None:
         lookbacks = _lb_defaults
     else:
@@ -1402,10 +1401,11 @@ def run(
         f"p_drop={p_drop:.2f}  edge_neg_thresh={edge_neg_thresh:.3f}\n"
         f"  vol models: ewma_lambda={ewma_lambda}  rho_prior={rho}  vol_veto_mult={vol_veto_mult}x"
     )
-    print(f"Output → {SIM_ROOT.resolve()}")
+    sim_root.mkdir(parents=True, exist_ok=True)
+    print(f"Output → {sim_root.resolve()}")
 
-    trade_out = _trade_out_path()
-    edge_out  = _edge_out_path()
+    trade_out = sim_root / f"trades_{_today_str()}.csv"
+    edge_out  = sim_root / f"edge_log_{_today_str()}.csv"
     _ensure_header(trade_out, TRADE_FIELDS)
     _ensure_header(edge_out,  EDGE_FIELDS)
 
@@ -1417,7 +1417,7 @@ def run(
         print(f"Real trades → {REAL_ROOT.resolve()}")
 
     # Load cumulative ledger at startup so scores show historical data immediately.
-    ledger_stats: dict[str, dict] = _update_performance_ledger()
+    ledger_stats: dict[str, dict] = _update_performance_ledger(sim_root)
 
     # ── Data-collector subprocesses ────────────────────────────────────────
     _HERE = Path(__file__).parent
@@ -1523,6 +1523,13 @@ def run(
 
         # ── 1. Early-exit checks for all open positions ─────────────────────
         still_open: list[dict] = []
+        # Per-poll caches to avoid redundant work across open positions.
+        # _exit_quote_cache: one HTTP call per contract_id per poll.
+        # _exit_edges_cache: one full model calibration per
+        #   (asset, strike, direction, settle_time) per poll — multiple model
+        #   positions on the same contract reuse the same edges dict.
+        _exit_quote_cache: dict[str, dict | None] = {}
+        _exit_edges_cache: dict[tuple, dict | None] = {}
         for pos in open_positions:
             cid     = pos["contract_id"]
             mdf     = minute_dfs.get(pos["asset"])
@@ -1530,9 +1537,13 @@ def run(
 
             # Pre-fetch live quote so exit DECISIONS use fresh bid/ask, not the
             # CSV value which can be up to poll_sec seconds stale.
-            live_q = _fetch_live_contract_quote(
-                session, pos.get("event_ticker", ""), cid
-            )
+            # Cache result so multiple model-positions on the same contract
+            # share one HTTP round-trip per poll.
+            if cid not in _exit_quote_cache:
+                _exit_quote_cache[cid] = _fetch_live_contract_quote(
+                    session, pos.get("event_ticker", ""), cid
+                )
+            live_q = _exit_quote_cache[cid]
             if live_q is not None:
                 # Merge fresh bid/ask into lat_row without mutating the cache.
                 if lat_row is not None:
@@ -1540,17 +1551,50 @@ def run(
                 else:
                     lat_row = live_q
 
+            # Pre-compute edges once per unique contract (same asset/strike/
+            # direction/settle_time) so multiple model-positions on the same
+            # contract don't each trigger 14-model Monte Carlo calibration.
+            edges_key = (
+                pos.get("asset"), pos.get("strike"),
+                pos.get("direction"), pos.get("settle_time_utc"),
+            )
+            if edges_key not in _exit_edges_cache:
+                spot_for_exit = live_spots.get(pos["asset"])
+                if mdf is not None and spot_for_exit is not None:
+                    try:
+                        _exit_edges_cache[edges_key] = _compute_edges(
+                            contract_id     = cid,
+                            spot            = spot_for_exit,
+                            strike          = float(pos["strike"]),
+                            direction       = pos["direction"],
+                            ask_yes         = _safe_float((lat_row or {}).get("ask_yes")),
+                            ask_no          = _safe_float((lat_row or {}).get("ask_no")),
+                            settle_time_utc = datetime.fromisoformat(pos["settle_time_utc"]),
+                            eval_time_utc   = now_utc,
+                            minute_df       = mdf,
+                            lookbacks       = lookbacks,
+                            ewma_lambda     = ewma_lambda,
+                            rho             = rho,
+                            vol_veto_mult   = vol_veto_mult,
+                        )
+                    except Exception:
+                        _exit_edges_cache[edges_key] = None
+                else:
+                    _exit_edges_cache[edges_key] = None
+
             exit_info = _check_early_exit(
                 pos, lat_row, mdf,
-                spot        = live_spots.get(pos["asset"]),
-                lookbacks   = lookbacks,
-                now_utc     = now_utc,
-                profit_lock = profit_lock,
-                stop_loss   = stop_loss,
-                p_drop      = p_drop,
-                ewma_lambda = ewma_lambda,
-                rho         = rho,
-                edge_neg_thresh = edge_neg_thresh,
+                spot             = live_spots.get(pos["asset"]),
+                lookbacks        = lookbacks,
+                now_utc          = now_utc,
+                profit_lock      = profit_lock,
+                stop_loss        = stop_loss,
+                p_drop           = p_drop,
+                ewma_lambda      = ewma_lambda,
+                rho              = rho,
+                edge_neg_thresh  = edge_neg_thresh,
+                vol_veto_mult    = vol_veto_mult,
+                precomputed_edges = _exit_edges_cache[edges_key],
             )
 
             if exit_info:
@@ -1643,7 +1687,7 @@ def run(
                 _log_exit(pos, exit_info)
                 n = pos.get("n_contracts_filled") or 0
                 session_pnl += exit_info["exit_pnl"] * n
-                ledger_stats = _update_performance_ledger()
+                ledger_stats = _update_performance_ledger(sim_root)
                 exit_reason = exit_info.get("exit_reason", "")
                 if exit_reason in ("stop_loss", "p_drop"):
                     # Market or model flagged this trade as wrong.  Penalise re-entry:
@@ -1673,7 +1717,7 @@ def run(
                 _log_settle(pos)
                 n = pos.get("n_contracts_filled") or 0
                 session_pnl += float(pos.get("pnl") or 0) * n
-                ledger_stats = _update_performance_ledger()
+                ledger_stats = _update_performance_ledger(sim_root)
                 # Contract is expired — no re-entry possible, but discard for consistency.
                 seen_by_model.get(pos["model"], set()).discard(pos["contract_id"])
             else:
@@ -1715,6 +1759,11 @@ def run(
 
         # ── 3b. Entry decisions for new contracts ─────────────────────────────
         # Iterate the *latest* row per contract — not the full history.
+        # Per-poll cache: at most one HTTP call per contract_id across all 14
+        # models. Without caching, every (contract × model) that finds edge
+        # fires a separate full event-list request — up to 14 calls per contract.
+        _entry_quote_cache: dict[str, dict | None] = {}
+
         # Using latest.values() ensures we always price against the freshest
         # bid/ask quote; iterating all rows would enter on the oldest quote
         # for any contract first seen at startup.
@@ -1934,9 +1983,12 @@ def run(
                 # ── Live quote: re-validate edge at true execution price ──────
                 # The CSV ask may be up to 60s stale. Fetch the live order book
                 # now; if the ask has moved and edge is gone, skip the trade.
-                live_q = _fetch_live_contract_quote(
-                    session, row.get("event_ticker", ""), contract_id
-                )
+                # Cache result: all models on the same contract share one HTTP call.
+                if contract_id not in _entry_quote_cache:
+                    _entry_quote_cache[contract_id] = _fetch_live_contract_quote(
+                        session, row.get("event_ticker", ""), contract_id
+                    )
+                live_q = _entry_quote_cache[contract_id]
                 if live_q is not None:
                     fresh_ask = live_q["ask_yes"] if side == "YES" else live_q["ask_no"]
                     if fresh_ask is not None:
@@ -1967,8 +2019,6 @@ def run(
                         "row": row, "side": side, "p_side": p_side,
                         "market_mid": market_mid, "edges": edges,
                     }
-                    seen_set.add(contract_id)   # block re-detection this poll
-                    seen_set.discard(contract_id)  # allow re-evaluation next poll
                     # Will be processed from pending_by_model at start of next poll
                     continue
 
@@ -2120,6 +2170,10 @@ if __name__ == "__main__":
                         help="Block entry when 10-min realized vol > this × EWMA vol (0=off)")
     parser.add_argument("--no-collectors", action="store_true",
                         help="Do not auto-start getdata_underlying / getdata_prediction_contract")
+    parser.add_argument("--trades-dir", type=str, default=None,
+                        help="Output directory for trades/ledger CSV files "
+                             "(default: .data/gemini/sim_trades). Use a different "
+                             "path to run a parallel experiment without mixing results.")
     args = parser.parse_args()
 
     run(
@@ -2150,4 +2204,5 @@ if __name__ == "__main__":
         edge_neg_thresh     = args.edge_neg_thresh,
         vol_veto_mult       = args.vol_veto_mult,
         no_collectors       = args.no_collectors,
+        sim_root            = Path(args.trades_dir) if args.trades_dir else SIM_ROOT,
     )
