@@ -45,12 +45,20 @@ def main() -> None:
     _lb = cfg.section("simulation.lookback")
 
     _lb_defaults = {
-        "gbm":    _lb.get("gbm",    24.0),
-        "ewma":   _lb.get("ewma",   48.0),
-        "garch":  _lb.get("garch",  72.0),
-        "stud":   _lb.get("stud",   48.0),
-        "skt":    _lb.get("skt",    48.0),
-        "heston": _lb.get("heston", 96.0),
+        "gbm":           _lb.get("gbm",           24.0),
+        "ewma":          _lb.get("ewma",          48.0),
+        "garch":         _lb.get("garch",         72.0),
+        "stud":          _lb.get("stud",          48.0),
+        "skt":           _lb.get("skt",           48.0),
+        "heston":        _lb.get("heston",        96.0),
+        "hybrid":        _lb.get("hybrid",        48.0),
+        "ou":            _lb.get("ou",            12.0),
+        "heston_ewma":   _lb.get("heston_ewma",   96.0),
+        "gbm_jump":      _lb.get("gbm_jump",      24.0),
+        "ewma_jump":     _lb.get("ewma_jump",     48.0),
+        "garch_jump":    _lb.get("garch_jump",    72.0),
+        "student_t_jump":_lb.get("student_t_jump",48.0),
+        "hybrid_t_jump": _lb.get("hybrid_t_jump", 48.0),
     }
 
     parser = argparse.ArgumentParser(
@@ -82,7 +90,11 @@ def main() -> None:
     )
 
     # ── Model selection ────────────────────────────────────────────────────────
-    _VALID_MODELS = {"gbm", "ewma", "garch", "student_t", "skewed_t", "heston"}
+    _VALID_MODELS = {
+        "gbm", "ewma", "garch", "student_t", "skewed_t", "heston",
+        "hybrid_t", "ou", "heston_ewma",
+        "gbm_jump", "ewma_jump", "garch_jump", "student_t_jump", "hybrid_t_jump",
+    }
     parser.add_argument(
         "--model",
         nargs="+",
@@ -91,8 +103,8 @@ def main() -> None:
         help=(
             "Restrict entry to one or more models. "
             f"Choices: {sorted(_VALID_MODELS)}. "
-            "Default: all six models. "
-            "Example: --model student_t  or  --model student_t gbm"
+            "Default: all 14 models. "
+            "Example: --model hybrid_t  or  --model hybrid_t hybrid_t_jump"
         ),
     )
 
@@ -101,8 +113,9 @@ def main() -> None:
     parser.add_argument("--min-edge",            type=float, default=_s.get("min_edge",            0.03))
     parser.add_argument("--max-hours-to-settle", type=float, default=_s.get("max_hours_to_settle", 1.5))
     parser.add_argument("--profit-lock",         type=float, default=_ex.get("profit_lock",        0.05))
-    parser.add_argument("--stop-loss",           type=float, default=_ex.get("stop_loss",          0.10))
+    parser.add_argument("--stop-loss",           type=float, default=_ex.get("stop_loss",          0.50))
     parser.add_argument("--p-drop",              type=float, default=_ex.get("p_drop",             0.05))
+    parser.add_argument("--edge-neg-thresh",     type=float, default=_ex.get("edge_neg_thresh",    0.02))
     parser.add_argument("--ewma-lambda",         type=float, default=_s.get("ewma_lambda",         0.94))
     parser.add_argument("--rho",                 type=float, default=_s.get("rho",                 -0.5))
     parser.add_argument("--lb-gbm",    type=float, default=_lb_defaults["gbm"])
@@ -111,6 +124,15 @@ def main() -> None:
     parser.add_argument("--lb-stud",   type=float, default=_lb_defaults["stud"])
     parser.add_argument("--lb-skt",    type=float, default=_lb_defaults["skt"])
     parser.add_argument("--lb-heston", type=float, default=_lb_defaults["heston"])
+    parser.add_argument("--lb-hybrid",      type=float, default=_lb_defaults["hybrid"])
+    parser.add_argument("--lb-ou",          type=float, default=_lb_defaults["ou"])
+    parser.add_argument("--lb-heston-ewma", type=float, default=_lb_defaults["heston_ewma"])
+    parser.add_argument("--lb-gbm-jump",    type=float, default=_lb_defaults["gbm_jump"])
+    parser.add_argument("--lb-ewma-jump",   type=float, default=_lb_defaults["ewma_jump"])
+    parser.add_argument("--lb-garch-jump",  type=float, default=_lb_defaults["garch_jump"])
+    parser.add_argument("--lb-stud-jump",   type=float, default=_lb_defaults["student_t_jump"])
+    parser.add_argument("--lb-hybrid-jump", type=float, default=_lb_defaults["hybrid_t_jump"])
+    parser.add_argument("--vol-veto-mult",  type=float, default=_s.get("vol_veto_mult", 2.0))
     parser.add_argument("--no-collectors", action="store_true",
                         help="Do not auto-start data collectors")
 
@@ -150,7 +172,7 @@ def main() -> None:
     )
 
     mode        = "SANDBOX (paper trading)" if args.sandbox else "LIVE (real money)"
-    model_str   = ", ".join(sorted(active_models)) if active_models else "all 6"
+    model_str   = ", ".join(sorted(active_models)) if active_models else "all 9"
     print(
         f"\n{'='*60}\n"
         f"  Gemini Prediction Markets — LIVE TRADER\n"
@@ -168,12 +190,20 @@ def main() -> None:
     run(
         poll_sec            = args.poll_sec,
         lookbacks           = {
-            "gbm":    args.lb_gbm,
-            "ewma":   args.lb_ewma,
-            "garch":  args.lb_garch,
-            "stud":   args.lb_stud,
-            "skt":    args.lb_skt,
-            "heston": args.lb_heston,
+            "gbm":           args.lb_gbm,
+            "ewma":          args.lb_ewma,
+            "garch":         args.lb_garch,
+            "stud":          args.lb_stud,
+            "skt":           args.lb_skt,
+            "heston":        args.lb_heston,
+            "hybrid":        args.lb_hybrid,
+            "ou":            args.lb_ou,
+            "heston_ewma":   args.lb_heston_ewma,
+            "gbm_jump":      args.lb_gbm_jump,
+            "ewma_jump":     args.lb_ewma_jump,
+            "garch_jump":    args.lb_garch_jump,
+            "student_t_jump":args.lb_stud_jump,
+            "hybrid_t_jump": args.lb_hybrid_jump,
         },
         min_edge            = args.min_edge,
         max_hours_to_settle = args.max_hours_to_settle,
@@ -182,6 +212,8 @@ def main() -> None:
         p_drop              = args.p_drop,
         ewma_lambda         = args.ewma_lambda,
         rho                 = args.rho,
+        edge_neg_thresh     = args.edge_neg_thresh,
+        vol_veto_mult       = args.vol_veto_mult,
         no_collectors       = args.no_collectors,
         trader              = trader,
         active_models       = active_models,

@@ -23,10 +23,11 @@ For each contract seen for the first time:
 On every subsequent poll for an open position, checks early-exit conditions:
 
   1. profit_lock  — bid_now - ask_entry >= --profit-lock  (e.g. 0.05 = 5¢ locked in)
-                    Sell early to capture realised gain before convergence reverses.
+                    Skipped when < 30 min to settlement — let winner run to expiry.
 
-  2. stop_loss    — ask_entry - bid_now >= --stop-loss    (e.g. 0.10 = 10¢ loss)
-                    Sell to cap downside; don't ride to zero.
+  2. stop_loss    — (ask_entry - bid_now) / ask_entry >= --stop-loss  (relative, e.g.
+                    0.50 = exit when bid has dropped 50% from entry price).
+                    A 19¢ entry stops at 9.5¢; a 64¢ entry stops at 32¢.
 
   3. p_drop       — model p(our side) fell by >= --p-drop from entry p_fair.
                     New data has made us less confident; exit before the market
@@ -85,11 +86,15 @@ except ImportError:
 
 from btc_hourly_model import (
     StudentTParams,
+    _minute_closes_before,
     _minute_log_returns_before,
     calibrate_ewma_from_log_returns,
     calibrate_garch_from_log_returns,
     calibrate_gbm_from_log_returns,
+    calibrate_heston_ewma_from_log_returns,
     calibrate_heston_from_log_returns,
+    calibrate_hybrid_t_from_log_returns,
+    calibrate_ou_from_closes,
     calibrate_skewed_t_from_log_returns,
     calibrate_student_t_from_log_returns,
     estimate_price_vol_rho,
@@ -97,9 +102,13 @@ from btc_hourly_model import (
     garch_binary_prob,
     gbm_binary_prob,
     heston_binary_prob,
+    hybrid_t_binary_prob,
     load_gemini_ohlcv,
+    ou_binary_prob,
     skewed_t_binary_prob,
     student_t_binary_prob,
+    calibrate_jumps_from_log_returns,
+    merton_binary_prob,
 )
 
 # ---------------------------------------------------------------------------
@@ -109,6 +118,7 @@ EST_TZ        = ZoneInfo("America/New_York")
 OHLCV_ROOT    = Path(".data/gemini/ohlcv_1m_7d")
 CONTRACT_ROOT = Path(".data/gemini/prediction_data")
 SIM_ROOT      = Path(".data/gemini/sim_trades")
+REAL_ROOT     = Path(".data/gemini/real_trades")
 
 ASSET_SYMBOLS   = {"BTC": "btcusd", "ETH": "ethusd", "SOL": "solusd"}
 GEMINI_BASE_URL = "https://api.gemini.com"
@@ -123,7 +133,7 @@ TRADE_FIELDS = [
     "settle_time_utc",
     "hours_to_settle_at_entry",
     "side",           # YES or NO
-    "model",          # gbm | ewma | garch | student_t | skewed_t | heston
+    "model",          # gbm | ewma | garch | student_t | skewed_t | heston | hybrid_t
     "p_fair",         # model prob for our side at entry
     "ask_price",      # cost to enter (e.g. 0.62)
     "edge",           # p_fair - ask_price at entry
@@ -151,6 +161,11 @@ PERF_LEDGER_FIELDS = [
     "total_pnl",         # sum of all pnl
     "avg_edge_at_entry", # mean model edge at entry time
     "as_of",             # UTC timestamp of last update
+]
+
+REAL_LEDGER_FIELDS = PERF_LEDGER_FIELDS + [
+    "total_real_dollars",         # sum of pnl × n_contracts_filled (real money P&L)
+    "avg_real_dollars_per_trade", # total_real_dollars / n_trades
 ]
 
 EDGE_FIELDS = [
@@ -181,6 +196,23 @@ EDGE_FIELDS = [
     # Heston stochastic vol (Monte Carlo, full-truncation Euler)
     "v0_heston", "kappa_heston", "theta_heston", "xi_heston", "rho_heston",
     "p_fair_heston", "edge_yes_heston", "edge_no_heston",
+    # Hybrid EWMA-σ + Student's t  (regime-aware fat tails)
+    "nu_hybrid", "sigma_annual_hybrid",
+    "p_fair_hybrid", "edge_yes_hybrid", "edge_no_hybrid",
+    # OU (Ornstein-Uhlenbeck on log-price)
+    "kappa_ou", "sigma_annual_ou",
+    "p_fair_ou", "edge_yes_ou", "edge_no_ou",
+    # Heston EWMA-calibrated variance
+    "v0_heston_ewma", "theta_heston_ewma",
+    "p_fair_heston_ewma", "edge_yes_heston_ewma", "edge_no_heston_ewma",
+    # Jump diagnostics (shared across jump models — calibrated from GBM lookback)
+    "lambda_j", "mu_j", "sigma_j",
+    # Merton Jump-Diffusion variants (p_fair + edges)
+    "p_fair_gbm_jump",    "edge_yes_gbm_jump",    "edge_no_gbm_jump",
+    "p_fair_ewma_jump",   "edge_yes_ewma_jump",   "edge_no_ewma_jump",
+    "p_fair_garch_jump",  "edge_yes_garch_jump",  "edge_no_garch_jump",
+    "p_fair_stud_jump",   "edge_yes_stud_jump",   "edge_no_stud_jump",
+    "p_fair_hybrid_jump", "edge_yes_hybrid_jump", "edge_no_hybrid_jump",
 ]
 
 
@@ -200,6 +232,11 @@ def _trade_out_path() -> Path:
 def _edge_out_path() -> Path:
     SIM_ROOT.mkdir(parents=True, exist_ok=True)
     return SIM_ROOT / f"edge_log_{_today_str()}.csv"
+
+
+def _real_trade_out_path() -> Path:
+    REAL_ROOT.mkdir(parents=True, exist_ok=True)
+    return REAL_ROOT / f"trades_{_today_str()}.csv"
 
 
 def _ensure_header(path: Path, fields: list[str]) -> None:
@@ -348,10 +385,12 @@ def _compute_edges(
     lookbacks: dict[str, float],
     ewma_lambda: float = 0.94,
     rho: float = -0.5,
+    vol_veto_mult: float = 2.0,
 ) -> dict | None:
-    """Calibrate all 6 models and return fair values + edge signals.
+    """Calibrate all 14 models and return fair values + edge signals.
 
-    Models: gbm | ewma | garch | student_t | skewed_t | heston
+    Models: gbm | ewma | garch | student_t | skewed_t | heston | hybrid_t | ou | heston_ewma
+            + gbm_jump | ewma_jump | garch_jump | student_t_jump | hybrid_t_jump
 
     `spot` is the current underlying price, fetched live from the Gemini
     ticker by the caller — NOT read from the OHLCV file.  The OHLCV file
@@ -375,19 +414,27 @@ def _compute_edges(
     if horizon_hours <= 0:
         return None
 
-    # Per-model log-return arrays — cached by window size to avoid re-reading.
-    _lr_cache: dict[float, object] = {}
+    # Per-model log-return and close-price arrays — cached by window size.
+    _lr_cache:     dict[float, object] = {}
+    _close_cache:  dict[float, object] = {}
     def _get_lr(lb: float):
         if lb not in _lr_cache:
             _lr_cache[lb] = _minute_log_returns_before(minute_df, eval_ts, lb)
         return _lr_cache[lb]
+    def _get_closes(lb: float):
+        if lb not in _close_cache:
+            _close_cache[lb] = _minute_closes_before(minute_df, eval_ts, lb)
+        return _close_cache[lb]
 
-    lb_gbm    = lookbacks.get("gbm",    24.0)
-    lb_ewma   = lookbacks.get("ewma",   48.0)
-    lb_garch  = lookbacks.get("garch",  72.0)
-    lb_stud   = lookbacks.get("stud",   48.0)
-    lb_skt    = lookbacks.get("skt",    48.0)
-    lb_heston = lookbacks.get("heston", 96.0)
+    lb_gbm        = lookbacks.get("gbm",        24.0)
+    lb_ewma       = lookbacks.get("ewma",       48.0)
+    lb_garch      = lookbacks.get("garch",      72.0)
+    lb_stud       = lookbacks.get("stud",       48.0)
+    lb_skt        = lookbacks.get("skt",        48.0)
+    lb_heston     = lookbacks.get("heston",     96.0)
+    lb_hybrid     = lookbacks.get("hybrid",     48.0)
+    lb_ou         = lookbacks.get("ou",         12.0)
+    lb_heston_ewma= lookbacks.get("heston_ewma",96.0)
 
     min_lr_gbm = _get_lr(lb_gbm)
     if len(min_lr_gbm) < 20:
@@ -409,6 +456,20 @@ def _compute_edges(
     except Exception:
         p_ewma = p_gbm;  sigma_ewma = gbm.sigma_per_sqrt_hour * sqrt(8_760)
         ewma_par = None
+
+    # ── Vol veto: block entry when short-term vol spikes above EWMA baseline ──
+    # Uses last 10 one-min bars (≈ 10 minutes) for the realised vol estimate.
+    # If that spike is > vol_veto_mult × EWMA vol, models are unreliable and
+    # we skip pricing entirely — returning None stops all entry signals.
+    if vol_veto_mult > 0:
+        _recent_lr = _get_lr(10 / 60)  # last 10 min
+        if len(_recent_lr) >= 5:
+            _sigma_recent_hourly = float(np.std(_recent_lr)) * sqrt(60)
+            _sigma_ewma_hourly   = (ewma_par.sigma_per_sqrt_hour
+                                    if ewma_par is not None
+                                    else gbm.sigma_per_sqrt_hour)
+            if _sigma_recent_hourly > vol_veto_mult * _sigma_ewma_hourly:
+                return None  # high-vol regime veto — skip all model signals
 
     # ── Model 3: GARCH(1,1) vol + GBM closed form ─────────────────────────
     try:
@@ -461,6 +522,121 @@ def _compute_edges(
         p_heston   = p_gbm
         heston_par = None
 
+    # ── Model 7: Hybrid EWMA-σ + Student's t (regime-aware fat tails) ───────
+    # Uses EWMA conditional vol (responsive to current moves) as σ, and fits ν
+    # from the kurtosis of EWMA-normalised residuals (tail shape only).
+    # Falls back to student_t result if calibration fails.
+    try:
+        min_lr_hybrid = _get_lr(lb_hybrid)
+        ewma_for_hybrid = ewma_par if ewma_par is not None else calibrate_ewma_from_log_returns(
+            min_lr_hybrid, lambda_=ewma_lambda)
+        hybrid_par = calibrate_hybrid_t_from_log_returns(min_lr_hybrid, ewma_for_hybrid)
+        # Scale to horizon (same as student_t: loc scales by n bars, scale by sqrt(n))
+        nh = max(1, round(horizon_hours * 60))
+        from btc_hourly_model import HybridTParams as _HybridTParams
+        hybrid_h = _HybridTParams(
+            sigma_per_sqrt_hour = hybrid_par.sigma_per_sqrt_hour,
+            nu                  = hybrid_par.nu,
+            mu_per_hour         = hybrid_par.mu_per_hour,
+        )
+        p_hybrid = hybrid_t_binary_prob(spot, strike, hybrid_h,
+                                        horizon_hours=horizon_hours,
+                                        direction=direction,
+                                        n_sims=20_000, seed=seed + 3)
+    except Exception:
+        p_hybrid   = p_stud
+        hybrid_par = None
+
+    # ── Model 8: OU (Ornstein-Uhlenbeck on log-price) ────────────────────────
+    # Closed-form pricing; captures short-term mean reversion.
+    # ln_s0 is overridden to log(live spot) so the starting point is exact.
+    try:
+        closes_ou = _get_closes(lb_ou)
+        ou_par    = calibrate_ou_from_closes(closes_ou)
+        ou_par    = type(ou_par)(
+            kappa = ou_par.kappa,
+            mu_ln = ou_par.mu_ln,
+            sigma = ou_par.sigma,
+            ln_s0 = float(np.log(spot)),   # use live spot, not last close
+        )
+        p_ou = ou_binary_prob(spot, strike, ou_par,
+                              horizon_hours=horizon_hours, direction=direction)
+    except Exception:
+        p_ou   = p_gbm
+        ou_par = None
+
+    # ── Model 9: Heston with EWMA-calibrated variance ────────────────────────
+    # theta is EWMA of hourly realised variances (lambda_h=0.9 / hourly bar).
+    # Regime-aware: vol spikes lift theta, preventing over-optimistic reversion.
+    try:
+        min_lr_heston_ewma = _get_lr(lb_heston_ewma)
+        heston_ewma_par = calibrate_heston_ewma_from_log_returns(
+            min_lr_heston_ewma, rho=rho_use, dt_hours=1 / 60
+        )
+        p_heston_ewma = heston_binary_prob(spot, strike, heston_ewma_par,
+                                           horizon_hours=horizon_hours,
+                                           direction=direction,
+                                           n_sims=20_000, seed=seed + 4)
+    except Exception:
+        p_heston_ewma   = p_heston
+        heston_ewma_par = None
+
+    # ── Models 10-14: Merton Jump-Diffusion variants ──────────────────────
+    # Each variant reuses its base model's sigma+mu and overlays jump pricing.
+    # Jump calibration uses the same lookback as the base model.
+    lb_jump = lookbacks.get("gbm_jump",      lb_gbm)
+    lb_jump_ewma    = lookbacks.get("ewma_jump",     lb_ewma)
+    lb_jump_garch   = lookbacks.get("garch_jump",    lb_garch)
+    lb_jump_stud    = lookbacks.get("student_t_jump",lb_stud)
+    lb_jump_hybrid  = lookbacks.get("hybrid_t_jump", lb_hybrid)
+
+    def _merton(sigma_h, mu_h, lr_for_jumps):
+        """Helper: calibrate jumps from lr_for_jumps, then call merton_binary_prob."""
+        try:
+            jp = calibrate_jumps_from_log_returns(lr_for_jumps, dt_hours=1 / 60)
+            if jp is None:
+                return None, None
+            return merton_binary_prob(
+                spot, strike, direction, horizon_hours,
+                sigma_diff=sigma_h, mu_hourly=mu_h, jump_params=jp,
+            ), jp
+        except Exception:
+            return None, None
+
+    # GBM+Jump
+    _p_gbm_j, _jp_gbm = _merton(gbm.sigma_per_sqrt_hour, gbm.mu_per_hour, _get_lr(lb_jump))
+    p_gbm_jump = _p_gbm_j if _p_gbm_j is not None else p_gbm
+
+    # EWMA+Jump
+    if ewma_par is not None:
+        _p_ewma_j, _jp_ewma = _merton(ewma_par.sigma_per_sqrt_hour, ewma_par.mu_per_hour, _get_lr(lb_jump_ewma))
+    else:
+        _p_ewma_j, _jp_ewma = None, None
+    p_ewma_jump = _p_ewma_j if _p_ewma_j is not None else p_ewma
+
+    # GARCH+Jump — use σ from GARCH forward vol (σ_per_sqrt_hour) if available
+    if garch_par is not None:
+        _p_garch_j, _jp_garch = _merton(garch_par.sigma_per_sqrt_hour, garch_par.mu_per_hour, _get_lr(lb_jump_garch))
+    else:
+        _p_garch_j, _jp_garch = None, None
+    p_garch_jump = _p_garch_j if _p_garch_j is not None else p_garch
+
+    # StudentT+Jump — σ from t-calibration (robust to outliers); Gaussian Merton pricing
+    # Note: explicit jump model partially replaces the fat-tail role of the t-distribution.
+    _stud_sigma_h = tpar_1m.scale * sqrt(60)   # convert 1-min scale to per-sqrt-hour
+    _stud_mu_h    = tpar_1m.loc   * 60         # 1-min loc to per-hour
+    _p_stud_j, _jp_stud = _merton(_stud_sigma_h, _stud_mu_h, _get_lr(lb_jump_stud))
+    p_stud_jump = _p_stud_j if _p_stud_j is not None else p_stud
+
+    # HybridT+Jump — EWMA σ (regime-responsive) + jump overlay
+    if hybrid_par is not None:
+        _hyb_sigma_h = hybrid_par.sigma_per_sqrt_hour
+        _hyb_mu_h    = hybrid_par.mu_per_hour
+        _p_hyb_j, _jp_hyb = _merton(_hyb_sigma_h, _hyb_mu_h, _get_lr(lb_jump_hybrid))
+    else:
+        _p_hyb_j, _jp_hyb = None, None
+    p_hybrid_jump = _p_hyb_j if _p_hyb_j is not None else p_hybrid
+
     # ── Pack results ──────────────────────────────────────────────────────
     result: dict = {
         "spot":              spot,
@@ -493,11 +669,37 @@ def _compute_edges(
         "xi_heston":    round(heston_par.xi,    4) if heston_par else None,
         "rho_heston":   round(heston_par.rho,   4) if heston_par else None,
         "p_fair_heston":     round(p_heston, 4),
+        # Hybrid EWMA-σ + Student's t
+        "nu_hybrid":          round(hybrid_par.nu, 2) if hybrid_par else None,
+        "sigma_annual_hybrid": round(hybrid_par.sigma_per_sqrt_hour * sqrt(8_760), 4) if hybrid_par else None,
+        "p_fair_hybrid":      round(p_hybrid, 4),
+        # OU
+        "kappa_ou":           round(ou_par.kappa, 4) if ou_par else None,
+        "sigma_annual_ou":    round(ou_par.sigma * sqrt(8_760), 4) if ou_par else None,
+        "p_fair_ou":          round(p_ou, 4),
+        # Heston EWMA
+        "v0_heston_ewma":     round(heston_ewma_par.v0,    6) if heston_ewma_par else None,
+        "theta_heston_ewma":  round(heston_ewma_par.theta, 6) if heston_ewma_par else None,
+        "p_fair_heston_ewma": round(p_heston_ewma, 4),
+        # Jump models — p_fair only (jump params logged via base model)
+        "p_fair_gbm_jump":      round(p_gbm_jump,   4),
+        "p_fair_ewma_jump":     round(p_ewma_jump,  4),
+        "p_fair_garch_jump":    round(p_garch_jump, 4),
+        "p_fair_stud_jump":     round(p_stud_jump,  4),
+        "p_fair_hybrid_jump":   round(p_hybrid_jump,4),
+        # Jump calibration diagnostics (from GBM lookback, representative)
+        "lambda_j":    round(_jp_gbm.lambda_j, 4) if _jp_gbm else None,
+        "mu_j":        round(_jp_gbm.mu_j,     6) if _jp_gbm else None,
+        "sigma_j":     round(_jp_gbm.sigma_j,  6) if _jp_gbm else None,
     }
 
     # ── Edge signals for each model ────────────────────────────────────────
     for key, p in [("gbm", p_gbm), ("ewma", p_ewma), ("garch", p_garch),
-                   ("stud", p_stud), ("skt", p_skt), ("heston", p_heston)]:
+                   ("stud", p_stud), ("skt", p_skt), ("heston", p_heston),
+                   ("hybrid", p_hybrid), ("ou", p_ou), ("heston_ewma", p_heston_ewma),
+                   ("gbm_jump", p_gbm_jump), ("ewma_jump", p_ewma_jump),
+                   ("garch_jump", p_garch_jump), ("stud_jump", p_stud_jump),
+                   ("hybrid_jump", p_hybrid_jump)]:
         result[f"edge_yes_{key}"] = round(p - ask_yes, 4)        if ask_yes is not None else None
         result[f"edge_no_{key}"]  = round((1.0 - p) - ask_no, 4) if ask_no  is not None else None
 
@@ -551,6 +753,12 @@ def _create_position(
         "theta_heston":             edges.get("theta_heston"),
         "xi_heston":                edges.get("xi_heston"),
         "rho_heston":               edges.get("rho_heston"),
+        "nu_hybrid":                edges.get("nu_hybrid"),
+        "sigma_annual_hybrid":      edges.get("sigma_annual_hybrid"),
+        "kappa_ou":                 edges.get("kappa_ou"),
+        "sigma_annual_ou":          edges.get("sigma_annual_ou"),
+        "v0_heston_ewma":           edges.get("v0_heston_ewma"),
+        "theta_heston_ewma":        edges.get("theta_heston_ewma"),
         "exit_time_utc":            None,
         "exit_reason":              None,
         "exit_bid":                 None,
@@ -577,14 +785,19 @@ def _check_early_exit(
     p_drop: float,
     ewma_lambda: float = 0.94,
     rho: float = -0.5,
+    edge_neg_thresh: float = 0.0,
 ) -> dict | None:
     """Check whether an open position should be closed before settlement.
 
     Checks four conditions in priority order:
       1. profit_lock  — bid has moved far enough in our favour → lock in gain.
-      2. stop_loss    — bid has moved far enough against us → cap the loss.
+                        Skipped when < 30 min to settlement (let it run to expiry).
+      2. stop_loss    — (bid_entry - bid_now) / ask_entry >= stop_loss (relative).
+                        50% of entry price means a 19¢ entry stops at 9.5¢.
       3. p_drop       — model probability for our side has fallen → information exit.
-      4. edge_closed  — current edge has gone negative → market has corrected.
+      4. edge_closed  — current edge < -edge_neg_thresh (negative by more than the
+                        hysteresis band).  0 = any negative edge triggers; 0.02 =
+                        edge must be at least −2¢ before we exit.
 
     Returns a dict with exit_reason/exit_bid/exit_pnl on trigger, else None.
     """
@@ -613,12 +826,18 @@ def _check_early_exit(
 
     realised_pnl = round(bid_now - ask_entry, 4)
 
-    # --- 1. Profit lock-in ---
-    if realised_pnl >= profit_lock:
+    # --- 1. Profit lock-in (skip when < 30 min to settlement — let it expire) ---
+    try:
+        mins_to_settle = (datetime.fromisoformat(pos["settle_time_utc"]) - now_utc).total_seconds() / 60
+    except (KeyError, ValueError):
+        mins_to_settle = 999.0
+    if realised_pnl >= profit_lock and mins_to_settle >= 30.0:
         return {"exit_reason": "profit_lock", "exit_bid": bid_now, "exit_pnl": realised_pnl}
 
-    # --- 2. Stop loss ---
-    if -realised_pnl >= stop_loss:
+    # --- 2. Stop loss (relative: loss as fraction of entry price) ---
+    # stop_loss = 0.50 means exit when bid drops to < 50% of ask_entry.
+    # e.g. entered at 19¢ → stop at 9.5¢; entered at 64¢ → stop at 32¢.
+    if ask_entry > 0 and -realised_pnl / ask_entry >= stop_loss:
         return {"exit_reason": "stop_loss", "exit_bid": bid_now, "exit_pnl": realised_pnl}
 
     # --- 3 & 4. Model-based exits (require fresh calibration + live spot) ---
@@ -647,12 +866,20 @@ def _check_early_exit(
 
             if edges is not None:
                 _p_key_map = {
-                    "gbm":       "gbm",
-                    "ewma":      "ewma",
-                    "garch":     "garch",
-                    "student_t": "stud",
-                    "skewed_t":  "skt",
-                    "heston":    "heston",
+                    "gbm":           "gbm",
+                    "ewma":          "ewma",
+                    "garch":         "garch",
+                    "student_t":     "stud",
+                    "skewed_t":      "skt",
+                    "heston":        "heston",
+                    "hybrid_t":      "hybrid",
+                    "ou":            "ou",
+                    "heston_ewma":   "heston_ewma",
+                    "gbm_jump":      "gbm_jump",
+                    "ewma_jump":     "ewma_jump",
+                    "garch_jump":    "garch_jump",
+                    "student_t_jump":"stud_jump",
+                    "hybrid_t_jump": "hybrid_jump",
                 }
                 p_key = _p_key_map.get(pos["model"], "gbm")
                 p_fair_now = edges[f"p_fair_{p_key}"]
@@ -669,10 +896,12 @@ def _check_early_exit(
                         "exit_pnl":    realised_pnl,
                     }
 
-                # 4. Edge has completely closed (market repriced to model).
+                # 4. Edge has closed past hysteresis band.
+                # edge_neg_thresh = 0.0 → any negative edge triggers.
+                # edge_neg_thresh = 0.02 → edge must be ≤ −0.02 to trigger.
                 edge_key = f"edge_yes_{p_key}" if side == "YES" else f"edge_no_{p_key}"
                 current_edge = edges.get(edge_key)
-                if current_edge is not None and current_edge <= 0:
+                if current_edge is not None and current_edge <= -edge_neg_thresh:
                     return {
                         "exit_reason": f"edge_closed({current_edge:.3f})",
                         "exit_bid":    bid_now,
@@ -796,7 +1025,11 @@ def _update_performance_ledger() -> dict[str, dict]:
     now_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00")
     out_rows = []
 
-    for model in ("gbm", "ewma", "garch", "student_t", "skewed_t", "heston"):
+    _ALL_MODELS = ("gbm", "ewma", "garch", "student_t", "skewed_t", "heston",
+                   "hybrid_t", "ou", "heston_ewma",
+                   "gbm_jump", "ewma_jump", "garch_jump", "student_t_jump", "hybrid_t_jump")
+
+    for model in _ALL_MODELS:
         trades = [r for r in closed if r.get("model") == model]
 
         if not trades:
@@ -845,6 +1078,91 @@ def _update_performance_ledger() -> dict[str, dict]:
         w.writerows(out_rows)
 
     return {r["model"]: r for r in out_rows}
+
+
+def _update_real_ledger() -> None:
+    """Recompute and overwrite real_trades/performance_ledger.csv from real trade files.
+
+    Same structure as the sim ledger but includes real-dollar columns
+    (total_real_dollars, avg_real_dollars_per_trade) derived from
+    pnl × n_contracts_filled.  Only written when live_trader.py is running.
+    """
+    REAL_ROOT.mkdir(parents=True, exist_ok=True)
+    all_rows: list[dict] = []
+    for fp in sorted(REAL_ROOT.glob("trades_*.csv")):
+        try:
+            with fp.open(newline="") as f:
+                all_rows.extend(list(csv.DictReader(f)))
+        except Exception:
+            pass
+
+    closed = [r for r in all_rows if r.get("status") in ("settled", "exited_early")]
+
+    now_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00:00")
+    out_rows = []
+
+    _ALL_MODELS = ("gbm", "ewma", "garch", "student_t", "skewed_t", "heston",
+                   "hybrid_t", "ou", "heston_ewma",
+                   "gbm_jump", "ewma_jump", "garch_jump", "student_t_jump", "hybrid_t_jump")
+
+    for model in _ALL_MODELS:
+        trades = [r for r in closed if r.get("model") == model]
+
+        if not trades:
+            out_rows.append({k: ("—" if k not in ("model", "as_of") else
+                                 (model if k == "model" else now_str))
+                             for k in REAL_LEDGER_FIELDS})
+            continue
+
+        pnls: list[float] = []
+        for r in trades:
+            try:
+                pnls.append(float(r["pnl"]))
+            except (ValueError, KeyError):
+                pnls.append(0.0)
+
+        edges: list[float] = []
+        for r in trades:
+            try:
+                edges.append(float(r["edge"]))
+            except (ValueError, KeyError):
+                pass
+
+        real_dollars: list[float] = []
+        for r, p in zip(trades, pnls):
+            try:
+                n = int(float(r.get("n_contracts_filled") or 0))
+                real_dollars.append(p * n)
+            except (ValueError, TypeError):
+                real_dollars.append(0.0)
+
+        n            = len(trades)
+        n_profitable = sum(1 for p in pnls if p > 0)
+        n_settled    = sum(1 for r in trades if r.get("status") == "settled")
+        n_early      = sum(1 for r in trades if r.get("status") == "exited_early")
+        total_real   = round(sum(real_dollars), 4)
+
+        out_rows.append({
+            "model":                    model,
+            "n_trades":                 n,
+            "n_profitable":             n_profitable,
+            "n_loss":                   n - n_profitable,
+            "n_settled":                n_settled,
+            "n_early_exit":             n_early,
+            "win_rate_pct":             round(100.0 * n_profitable / n, 1),
+            "avg_pnl":                  round(sum(pnls) / n, 4),
+            "total_pnl":                round(sum(pnls), 4),
+            "avg_edge_at_entry":        round(sum(edges) / len(edges), 4) if edges else "—",
+            "as_of":                    now_str,
+            "total_real_dollars":       total_real,
+            "avg_real_dollars_per_trade": round(total_real / n, 4),
+        })
+
+    ledger_path = REAL_ROOT / "performance_ledger.csv"
+    with ledger_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=REAL_LEDGER_FIELDS)
+        w.writeheader()
+        w.writerows(out_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -905,6 +1223,29 @@ def _log_enter(pos: dict) -> None:
         v0    = pos.get("v0_heston")    or 0.0
         s_an  = sqrt(v0 * 8_760) * 100 if v0 > 0 else 0.0
         params = f"κ={kappa:.1f}  ξ={xi:.3f}  ρ={rho_h:.3f}  σ₀={s_an:.1f}%"
+    elif model == "hybrid_t":
+        nu   = pos.get("nu_hybrid") or 0.0
+        s_an = (pos.get("sigma_annual_hybrid") or 0.0) * 100
+        params = f"ν={nu:.1f}  σ_ewma={s_an:.1f}%"
+    elif model == "ou":
+        kappa = pos.get("kappa_ou") or 0.0
+        s_an  = (pos.get("sigma_annual_ou") or 0.0) * 100
+        params = f"κ={kappa:.2f}/h  σ={s_an:.1f}%"
+    elif model == "heston_ewma":
+        v0    = pos.get("v0_heston_ewma")    or 0.0
+        theta = pos.get("theta_heston_ewma") or 0.0
+        s_an  = sqrt(v0 * 8_760) * 100 if v0 > 0 else 0.0
+        params = f"v0_σ={s_an:.1f}%  θ={theta:.6f}"
+    elif model in ("gbm_jump", "ewma_jump", "garch_jump", "hybrid_t_jump"):
+        base = model.replace("_jump", "")
+        s_key = {"gbm": "sigma_annual_gbm", "ewma": "sigma_annual_ewma",
+                 "garch": "sigma_annual_garch", "hybrid_t": "sigma_annual_hybrid"}.get(base, "sigma_annual_gbm")
+        s_an = (pos.get(s_key) or 0.0) * 100
+        params = f"σ_diff={s_an:.1f}%  +jump"
+    elif model == "student_t_jump":
+        s_an = (pos.get("sigma_annual_stud") or 0.0) * 100
+        nu   = pos.get("nu_stud") or 0.0
+        params = f"ν={nu:.1f}  σ={s_an:.1f}%  +jump"
     else:  # student_t
         nu   = pos.get("nu_stud") or 0.0
         s_an = (pos.get("sigma_annual_stud") or 0.0) * 100
@@ -925,9 +1266,11 @@ def _log_exit(pos: dict, exit_info: dict) -> None:
     bid_pct   = exit_info["exit_bid"] * 100
     pnl       = exit_info["exit_pnl"]
     reason    = exit_info["exit_reason"]
+    n         = pos.get("n_contracts_filled")
+    dollar_str = f"  real=${pnl * n:+.2f}" if n else ""
     print(
         f"  [EXIT]   {label:<22}  {side}  {reason:<28}  "
-        f"entry={entry_pct:.1f}%  bid={bid_pct:.1f}%  pnl={pnl:+.2f}   [{model}]"
+        f"entry={entry_pct:.1f}%  bid={bid_pct:.1f}%  pnl={pnl:+.2f}{dollar_str}   [{model}]"
     )
 
 
@@ -942,9 +1285,11 @@ def _log_settle(pos: dict) -> None:
     won    = (side == "YES" and outcome == "YES_WIN") or (side == "NO" and outcome == "NO_WIN")
     result = "WIN " if won else "LOSS"
     spot_str = f"${spot:>10,.2f}" if isinstance(spot, (int, float)) else str(spot)
+    n         = pos.get("n_contracts_filled")
+    dollar_str = f"  real=${pnl * n:+.2f}" if n else ""
     print(
         f"  [SETTLE] {label:<22}  {side}  {result}  "
-        f"spot={spot_str}  strike=${strike:,.0f}  pnl={pnl:+.2f}   [{model}]"
+        f"spot={spot_str}  strike=${strike:,.0f}  pnl={pnl:+.2f}{dollar_str}   [{model}]"
     )
 
 
@@ -957,6 +1302,7 @@ def _print_summary(
     open_pos: list[dict],
     session_closed: int,
     ledger: dict[str, dict],
+    session_pnl: float = 0.0,   # real dollar P&L this session (contracts × per-unit pnl)
 ) -> None:
     """Print one-line status: open positions, session closed count, cumulative model P&L.
 
@@ -996,14 +1342,23 @@ def _print_summary(
         return f"{tag}: {pnl:+.2f} ({wins}/{n}, {early}e, {wr:.0f}%)"
 
     parts = "  ".join([
-        fmt("gbm",       "GBM"),
-        fmt("ewma",      "EWMA"),
-        fmt("garch",     "GARCH"),
-        fmt("student_t", "StudT"),
-        fmt("skewed_t",  "SktT"),
-        fmt("heston",    "Heston"),
+        fmt("gbm",           "GBM"),
+        fmt("ewma",          "EWMA"),
+        fmt("garch",         "GARCH"),
+        fmt("student_t",     "StudT"),
+        fmt("skewed_t",      "SktT"),
+        fmt("heston",        "Heston"),
+        fmt("hybrid_t",      "HybT"),
+        fmt("ou",            "OU"),
+        fmt("heston_ewma",   "HestEW"),
+        fmt("gbm_jump",      "GBM+J"),
+        fmt("ewma_jump",     "EWMA+J"),
+        fmt("garch_jump",    "GARCH+J"),
+        fmt("student_t_jump","StudT+J"),
+        fmt("hybrid_t_jump", "HybT+J"),
     ])
-    print(f"[{ts}]  {open_str}  session_closed={session_closed}  {parts}")
+    pnl_str = f"  session_pnl=${session_pnl:+.2f}" if session_pnl != 0.0 else ""
+    print(f"[{ts}]  {open_str}  session_closed={session_closed}{pnl_str}  {parts}")
 
 
 # ---------------------------------------------------------------------------
@@ -1016,17 +1371,22 @@ def run(
     min_edge:           float = 0.03,
     max_hours_to_settle:float = 1.5,
     profit_lock:        float = 0.05,
-    stop_loss:          float = 0.10,
+    stop_loss:          float = 0.50,
     p_drop:             float = 0.05,
     ewma_lambda:        float = 0.94,
     rho:                float = -0.5,
+    edge_neg_thresh:    float = 0.02,
+    vol_veto_mult:      float = 2.0,
     no_collectors:      bool  = False,
     trader=None,        # GeminiTrader | None  — None = simulation only
-    active_models:      set | None = None,  # restrict entry to these models; None = all 6
+    active_models:      set | None = None,  # restrict entry to these models; None = all 14
 ) -> None:
-    """Poll contract data, calibrate all 6 models, simulate trades, manage exits."""
+    """Poll contract data, calibrate all 14 models, simulate trades, manage exits."""
     _lb_defaults = {"gbm": 24.0, "ewma": 48.0, "garch": 72.0,
-                    "stud": 48.0, "skt": 48.0, "heston": 96.0}
+                    "stud": 48.0, "skt": 48.0, "heston": 96.0,
+                    "hybrid": 48.0, "ou": 12.0, "heston_ewma": 96.0,
+                    "gbm_jump": 24.0, "ewma_jump": 48.0, "garch_jump": 72.0,
+                    "student_t_jump": 48.0, "hybrid_t_jump": 48.0}
     if lookbacks is None:
         lookbacks = _lb_defaults
     else:
@@ -1038,8 +1398,9 @@ def run(
         f"Starting live trading simulation\n"
         f"  poll={poll_sec}s  min_edge={min_edge:.1%}  max_horizon={max_hours_to_settle}h\n"
         f"  lookbacks: {lb_str}\n"
-        f"  exit: profit_lock={profit_lock:.2f}  stop_loss={stop_loss:.2f}  p_drop={p_drop:.2f}\n"
-        f"  vol models: ewma_lambda={ewma_lambda}  rho_prior={rho}"
+        f"  exit: profit_lock={profit_lock:.2f}  stop_loss={stop_loss:.0%}(rel)  "
+        f"p_drop={p_drop:.2f}  edge_neg_thresh={edge_neg_thresh:.3f}\n"
+        f"  vol models: ewma_lambda={ewma_lambda}  rho_prior={rho}  vol_veto_mult={vol_veto_mult}x"
     )
     print(f"Output → {SIM_ROOT.resolve()}")
 
@@ -1047,6 +1408,13 @@ def run(
     edge_out  = _edge_out_path()
     _ensure_header(trade_out, TRADE_FIELDS)
     _ensure_header(edge_out,  EDGE_FIELDS)
+
+    # Real-money trade log — only created when a live trader is injected.
+    real_trade_out: Path | None = None
+    if trader is not None:
+        real_trade_out = _real_trade_out_path()
+        _ensure_header(real_trade_out, TRADE_FIELDS)
+        print(f"Real trades → {REAL_ROOT.resolve()}")
 
     # Load cumulative ledger at startup so scores show historical data immediately.
     ledger_stats: dict[str, dict] = _update_performance_ledger()
@@ -1072,27 +1440,54 @@ def run(
             else:
                 print(f"  [collector] WARNING: {script.name} not found — skipping")
 
-    seen_gbm:    set[str] = set()
-    seen_ewma:   set[str] = set()
-    seen_garch:  set[str] = set()
-    seen_stud:   set[str] = set()
-    seen_skt:    set[str] = set()
-    seen_heston: set[str] = set()
+    seen_gbm:         set[str] = set()
+    seen_ewma:        set[str] = set()
+    seen_garch:       set[str] = set()
+    seen_stud:        set[str] = set()
+    seen_skt:          set[str] = set()
+    seen_heston:       set[str] = set()
+    seen_hybrid:       set[str] = set()
+    seen_ou:           set[str] = set()
+    seen_heston_ewma:  set[str] = set()
+    seen_gbm_jump:     set[str] = set()
+    seen_ewma_jump:    set[str] = set()
+    seen_garch_jump:   set[str] = set()
+    seen_stud_jump:    set[str] = set()
+    seen_hybrid_jump:  set[str] = set()
     # Contracts that have had their edge signal logged (once per contract per session).
     # Independent of model selection so edge log is written regardless of active_models.
     edge_seen: set[str] = set()
     # Maps model name → its seen_set so closed positions can be removed,
     # allowing re-entry if a new edge appears on the same contract later.
     seen_by_model: dict[str, set[str]] = {
-        "gbm":       seen_gbm,
-        "ewma":      seen_ewma,
-        "garch":     seen_garch,
-        "student_t": seen_stud,
-        "skewed_t":  seen_skt,
-        "heston":    seen_heston,
+        "gbm":           seen_gbm,
+        "ewma":          seen_ewma,
+        "garch":         seen_garch,
+        "student_t":     seen_stud,
+        "skewed_t":      seen_skt,
+        "heston":        seen_heston,
+        "hybrid_t":      seen_hybrid,
+        "ou":            seen_ou,
+        "heston_ewma":   seen_heston_ewma,
+        "gbm_jump":      seen_gbm_jump,
+        "ewma_jump":     seen_ewma_jump,
+        "garch_jump":    seen_garch_jump,
+        "student_t_jump":seen_stud_jump,
+        "hybrid_t_jump": seen_hybrid_jump,
     }
+    # Entry delay: (sim only) holds pending entries for one poll before executing.
+    # Key: model_name. Value: dict[contract_id → entry metadata].
+    # On next poll, entries here are executed at the *current* ask price (simulates
+    # the 1-poll retry delay seen in live IOC order flow).
+    pending_by_model: dict[str, dict] = {
+        m: {} for m in seen_by_model
+    }
+    # Contracts penalised after stop_loss or p_drop — require 2× min_edge to re-enter.
+    # Key: f"{model}:{contract_id}".
+    reentry_penalised: set[str] = set()
     open_positions:   list[dict] = []
     closed_positions: list[dict] = []
+    session_pnl:      float      = 0.0   # real dollar P&L this session
 
     # Terminate collectors when the sim exits for any reason.
     import atexit
@@ -1133,26 +1528,36 @@ def run(
             mdf     = minute_dfs.get(pos["asset"])
             lat_row = latest.get(cid)
 
+            # Pre-fetch live quote so exit DECISIONS use fresh bid/ask, not the
+            # CSV value which can be up to poll_sec seconds stale.
+            live_q = _fetch_live_contract_quote(
+                session, pos.get("event_ticker", ""), cid
+            )
+            if live_q is not None:
+                # Merge fresh bid/ask into lat_row without mutating the cache.
+                if lat_row is not None:
+                    lat_row = {**lat_row, **{k: v for k, v in live_q.items() if v is not None}}
+                else:
+                    lat_row = live_q
+
             exit_info = _check_early_exit(
                 pos, lat_row, mdf,
-                spot     = live_spots.get(pos["asset"]),
-                lookbacks= lookbacks,
-                now_utc  = now_utc,
+                spot        = live_spots.get(pos["asset"]),
+                lookbacks   = lookbacks,
+                now_utc     = now_utc,
                 profit_lock = profit_lock,
                 stop_loss   = stop_loss,
                 p_drop      = p_drop,
                 ewma_lambda = ewma_lambda,
                 rho         = rho,
+                edge_neg_thresh = edge_neg_thresh,
             )
 
             if exit_info:
-                # ── Live quote: use true bid at moment of exit ───────────────
-                live_q = _fetch_live_contract_quote(
-                    session, pos.get("event_ticker", ""), pos["contract_id"]
-                )
+                # Live quote already fetched above — refresh exit_bid if we got one.
                 if live_q is not None:
                     side = pos["side"]
-                    fresh_bid = live_q["bid_yes"] if side == "YES" else live_q["bid_no"]
+                    fresh_bid = live_q.get("bid_yes" if side == "YES" else "bid_no")
                     if fresh_bid is not None:
                         exit_info["exit_bid"] = fresh_bid
                         exit_info["exit_pnl"] = round(
@@ -1199,20 +1604,58 @@ def run(
                                     f"status={sell['status']}"
                                 )
                         except Exception as exc:
-                            # Sell failed entirely — keep position open and retry next poll
-                            print(
-                                f"    [SELL]  FAILED: {exc} "
-                                f"— keeping position open for retry"
+                            exc_str = str(exc)
+                            _no_position = (
+                                "InsufficientFunds" in exc_str
+                                or "InsufficientPosition" in exc_str
+                                # Gemini ValidationError: "Cannot sell YES/NO contracts.
+                                # No YES/NO position found." — same root cause.
+                                or "No YES position found" in exc_str
+                                or "No NO position found" in exc_str
+                                or "position found" in exc_str  # catch any future wording
                             )
-                            still_open.append(pos)
-                            continue
+                            if _no_position:
+                                # Exchange says we don't hold these contracts — they were
+                                # already settled or sold externally.  Force-close at $0
+                                # so we don't loop forever trying to sell phantom contracts.
+                                print(
+                                    f"    [SELL]  Position gone on exchange — "
+                                    f"force-closing at $0 ({exc_str[:80]})"
+                                )
+                                exit_info["exit_bid"] = 0.0
+                                exit_info["exit_pnl"] = round(0.0 - float(pos["ask_price"]), 4)
+                                pos["n_contracts_filled"] = 0  # nothing left to sell
+                                # fall through to _apply_early_exit below
+                            else:
+                                # Other error — keep open and retry next poll
+                                print(
+                                    f"    [SELL]  FAILED: {exc} "
+                                    f"— keeping position open for retry"
+                                )
+                                still_open.append(pos)
+                                continue
                 _apply_early_exit(pos, exit_info, now_utc)
                 closed_positions.append(pos)
                 _append_csv(trade_out, pos, TRADE_FIELDS)
+                if real_trade_out is not None:
+                    _append_csv(real_trade_out, pos, TRADE_FIELDS)
+                    _update_real_ledger()
                 _log_exit(pos, exit_info)
+                n = pos.get("n_contracts_filled") or 0
+                session_pnl += exit_info["exit_pnl"] * n
                 ledger_stats = _update_performance_ledger()
-                # Allow re-entry: remove from seen so edge is re-evaluated next poll.
-                seen_by_model.get(pos["model"], set()).discard(pos["contract_id"])
+                exit_reason = exit_info.get("exit_reason", "")
+                if exit_reason in ("stop_loss", "p_drop"):
+                    # Market or model flagged this trade as wrong.  Penalise re-entry:
+                    # contract stays in seen_set AND requires 2× edge to re-enter.
+                    pen_key = f"{pos['model']}:{pos['contract_id']}"
+                    reentry_penalised.add(pen_key)
+                    # Keep in seen_set so standard min_edge re-entry is blocked.
+                    # The 2× threshold in the entry loop still allows high-conviction
+                    # re-entries while filtering opportunistic ones.
+                else:
+                    # profit_lock / edge_closed — allow normal re-entry.
+                    seen_by_model.get(pos["model"], set()).discard(pos["contract_id"])
             else:
                 still_open.append(pos)
         open_positions = still_open
@@ -1224,7 +1667,12 @@ def run(
             if _try_settle(pos, mdf, now_utc):
                 closed_positions.append(pos)
                 _append_csv(trade_out, pos, TRADE_FIELDS)
+                if real_trade_out is not None:
+                    _append_csv(real_trade_out, pos, TRADE_FIELDS)
+                    _update_real_ledger()
                 _log_settle(pos)
+                n = pos.get("n_contracts_filled") or 0
+                session_pnl += float(pos.get("pnl") or 0) * n
                 ledger_stats = _update_performance_ledger()
                 # Contract is expired — no re-entry possible, but discard for consistency.
                 seen_by_model.get(pos["model"], set()).discard(pos["contract_id"])
@@ -1232,7 +1680,40 @@ def run(
                 still_open.append(pos)
         open_positions = still_open
 
-        # ── 3. Entry decisions for new contracts ─────────────────────────────
+        # ── 3a. Process delayed sim entries from previous poll ────────────────
+        # For simulation-only (trader=None): contracts queued in pending_by_model
+        # are entered NOW at the CURRENT ask — one poll after the edge was first seen.
+        # This mimics the one-poll IOC retry lag in live trading.
+        if trader is None:
+            for _model_name, _pending in list(pending_by_model.items()):
+                _seen_set = seen_by_model.get(_model_name, set())
+                for _cid, _pdata in list(_pending.items()):
+                    _lat = latest.get(_cid)
+                    if _lat is None:
+                        _pending.pop(_cid, None)
+                        continue
+                    _side  = _pdata["side"]
+                    _p_sid = _pdata["p_side"]
+                    _cur_ask = _safe_float(_lat.get("ask_yes" if _side == "YES" else "ask_no"))
+                    if _cur_ask is None:
+                        _pending.pop(_cid, None)
+                        continue
+                    _cur_edge = round(_p_sid - _cur_ask, 4)
+                    if _cur_edge <= min_edge:
+                        # Edge gone at execution — cancel, allow re-detection
+                        _pending.pop(_cid, None)
+                        continue
+                    # Enter at current (next-poll) ask price — realistic entry
+                    _pos = _create_position(
+                        _pdata["row"], _model_name, _side, _cur_ask,
+                        _p_sid, _cur_edge, _pdata["market_mid"], _pdata["edges"]
+                    )
+                    _seen_set.add(_cid)
+                    open_positions.append(_pos)
+                    _log_enter(_pos)
+                    _pending.pop(_cid, None)
+
+        # ── 3b. Entry decisions for new contracts ─────────────────────────────
         # Iterate the *latest* row per contract — not the full history.
         # Using latest.values() ensures we always price against the freshest
         # bid/ask quote; iterating all rows would enter on the oldest quote
@@ -1269,14 +1750,25 @@ def run(
             # need_X is False for inactive models so they don't prevent the outer
             # skip guard from firing and don't force _compute_edges on every poll.
             _am = active_models
-            need_gbm    = (contract_id not in seen_gbm)    and (_am is None or "gbm"       in _am)
-            need_ewma   = (contract_id not in seen_ewma)   and (_am is None or "ewma"      in _am)
-            need_garch  = (contract_id not in seen_garch)  and (_am is None or "garch"     in _am)
-            need_stud   = (contract_id not in seen_stud)   and (_am is None or "student_t" in _am)
-            need_skt    = (contract_id not in seen_skt)    and (_am is None or "skewed_t"  in _am)
-            need_heston = (contract_id not in seen_heston) and (_am is None or "heston"    in _am)
-            need_edge   = contract_id not in edge_seen  # edge log independent of model filter
-            if not (need_gbm or need_ewma or need_garch or need_stud or need_skt or need_heston or need_edge):
+            need_gbm         = (contract_id not in seen_gbm)         and (_am is None or "gbm"            in _am)
+            need_ewma        = (contract_id not in seen_ewma)        and (_am is None or "ewma"           in _am)
+            need_garch       = (contract_id not in seen_garch)       and (_am is None or "garch"          in _am)
+            need_stud        = (contract_id not in seen_stud)        and (_am is None or "student_t"      in _am)
+            need_skt         = (contract_id not in seen_skt)         and (_am is None or "skewed_t"       in _am)
+            need_heston      = (contract_id not in seen_heston)      and (_am is None or "heston"         in _am)
+            need_hybrid      = (contract_id not in seen_hybrid)      and (_am is None or "hybrid_t"       in _am)
+            need_ou          = (contract_id not in seen_ou)          and (_am is None or "ou"             in _am)
+            need_heston_ewma = (contract_id not in seen_heston_ewma) and (_am is None or "heston_ewma"    in _am)
+            need_gbm_jump    = (contract_id not in seen_gbm_jump)    and (_am is None or "gbm_jump"       in _am)
+            need_ewma_jump   = (contract_id not in seen_ewma_jump)   and (_am is None or "ewma_jump"      in _am)
+            need_garch_jump  = (contract_id not in seen_garch_jump)  and (_am is None or "garch_jump"     in _am)
+            need_stud_jump   = (contract_id not in seen_stud_jump)   and (_am is None or "student_t_jump" in _am)
+            need_hybrid_jump = (contract_id not in seen_hybrid_jump) and (_am is None or "hybrid_t_jump"  in _am)
+            need_edge        = contract_id not in edge_seen  # edge log independent of model filter
+            if not (need_gbm or need_ewma or need_garch or need_stud or need_skt or need_heston
+                    or need_hybrid or need_ou or need_heston_ewma
+                    or need_gbm_jump or need_ewma_jump or need_garch_jump
+                    or need_stud_jump or need_hybrid_jump or need_edge):
                 continue
 
             edges = _compute_edges(
@@ -1292,6 +1784,7 @@ def run(
                 lookbacks       = lookbacks,
                 ewma_lambda     = ewma_lambda,
                 rho             = rho,
+                vol_veto_mult   = vol_veto_mult,
             )
 
             if need_edge:  # log edge signals once per contract (all models in one row)
@@ -1345,15 +1838,61 @@ def run(
                     "p_fair_heston":      edges["p_fair_heston"]      if edges else None,
                     "edge_yes_heston":    edges.get("edge_yes_heston") if edges else None,
                     "edge_no_heston":     edges.get("edge_no_heston")  if edges else None,
+                    # Hybrid EWMA-σ + Student's t
+                    "nu_hybrid":          edges.get("nu_hybrid")       if edges else None,
+                    "sigma_annual_hybrid":edges.get("sigma_annual_hybrid") if edges else None,
+                    "p_fair_hybrid":      edges["p_fair_hybrid"]       if edges else None,
+                    "edge_yes_hybrid":    edges.get("edge_yes_hybrid") if edges else None,
+                    "edge_no_hybrid":     edges.get("edge_no_hybrid")  if edges else None,
+                    # OU
+                    "kappa_ou":           edges.get("kappa_ou")            if edges else None,
+                    "sigma_annual_ou":    edges.get("sigma_annual_ou")     if edges else None,
+                    "p_fair_ou":          edges.get("p_fair_ou")           if edges else None,
+                    "edge_yes_ou":        edges.get("edge_yes_ou")         if edges else None,
+                    "edge_no_ou":         edges.get("edge_no_ou")          if edges else None,
+                    # Heston EWMA
+                    "v0_heston_ewma":     edges.get("v0_heston_ewma")      if edges else None,
+                    "theta_heston_ewma":  edges.get("theta_heston_ewma")   if edges else None,
+                    "p_fair_heston_ewma": edges.get("p_fair_heston_ewma")  if edges else None,
+                    "edge_yes_heston_ewma":edges.get("edge_yes_heston_ewma") if edges else None,
+                    "edge_no_heston_ewma": edges.get("edge_no_heston_ewma")  if edges else None,
+                    # Jump diagnostics
+                    "lambda_j": edges.get("lambda_j") if edges else None,
+                    "mu_j":     edges.get("mu_j")     if edges else None,
+                    "sigma_j":  edges.get("sigma_j")  if edges else None,
+                    # Jump models
+                    "p_fair_gbm_jump":    edges.get("p_fair_gbm_jump")    if edges else None,
+                    "edge_yes_gbm_jump":  edges.get("edge_yes_gbm_jump")  if edges else None,
+                    "edge_no_gbm_jump":   edges.get("edge_no_gbm_jump")   if edges else None,
+                    "p_fair_ewma_jump":   edges.get("p_fair_ewma_jump")   if edges else None,
+                    "edge_yes_ewma_jump": edges.get("edge_yes_ewma_jump") if edges else None,
+                    "edge_no_ewma_jump":  edges.get("edge_no_ewma_jump")  if edges else None,
+                    "p_fair_garch_jump":  edges.get("p_fair_garch_jump")  if edges else None,
+                    "edge_yes_garch_jump":edges.get("edge_yes_garch_jump")if edges else None,
+                    "edge_no_garch_jump": edges.get("edge_no_garch_jump") if edges else None,
+                    "p_fair_stud_jump":   edges.get("p_fair_stud_jump")   if edges else None,
+                    "edge_yes_stud_jump": edges.get("edge_yes_stud_jump") if edges else None,
+                    "edge_no_stud_jump":  edges.get("edge_no_stud_jump")  if edges else None,
+                    "p_fair_hybrid_jump": edges.get("p_fair_hybrid_jump") if edges else None,
+                    "edge_yes_hybrid_jump":edges.get("edge_yes_hybrid_jump") if edges else None,
+                    "edge_no_hybrid_jump": edges.get("edge_no_hybrid_jump")  if edges else None,
                 }, EDGE_FIELDS)
 
             for model_name, p_key, seen_set, needed in [
-                ("gbm",       "gbm",    seen_gbm,    need_gbm),
-                ("ewma",      "ewma",   seen_ewma,   need_ewma),
-                ("garch",     "garch",  seen_garch,  need_garch),
-                ("student_t", "stud",   seen_stud,   need_stud),
-                ("skewed_t",  "skt",    seen_skt,    need_skt),
-                ("heston",    "heston", seen_heston, need_heston),
+                ("gbm",           "gbm",        seen_gbm,         need_gbm),
+                ("ewma",          "ewma",       seen_ewma,        need_ewma),
+                ("garch",         "garch",      seen_garch,       need_garch),
+                ("student_t",     "stud",       seen_stud,        need_stud),
+                ("skewed_t",      "skt",        seen_skt,         need_skt),
+                ("heston",        "heston",     seen_heston,      need_heston),
+                ("hybrid_t",      "hybrid",     seen_hybrid,      need_hybrid),
+                ("ou",            "ou",         seen_ou,          need_ou),
+                ("heston_ewma",   "heston_ewma",seen_heston_ewma, need_heston_ewma),
+                ("gbm_jump",      "gbm_jump",   seen_gbm_jump,    need_gbm_jump),
+                ("ewma_jump",     "ewma_jump",  seen_ewma_jump,   need_ewma_jump),
+                ("garch_jump",    "garch_jump", seen_garch_jump,  need_garch_jump),
+                ("student_t_jump","stud_jump",  seen_stud_jump,   need_stud_jump),
+                ("hybrid_t_jump", "hybrid_jump",seen_hybrid_jump, need_hybrid_jump),
             ]:
                 if not needed:
                     continue  # already evaluated for this model
@@ -1374,10 +1913,19 @@ def run(
 
                 side = edge_val = ask_price = p_side = None
 
-                if (edge_yes is not None and edge_yes > min_edge and ask_yes is not None and
+                # After a stop_loss or p_drop exit on this contract+model combo, require
+                # 2× the normal edge before re-entering (soft re-entry gate).
+                pen_key   = f"{model_name}:{contract_id}"
+                entry_thr = min_edge * 2.0 if pen_key in reentry_penalised else min_edge
+                # Near-expiry scaling: require proportionally more edge as T → 0.
+                # At ≥30 min: scale=1.0; at 15 min: scale=1.5; at 0 min: scale=2.0.
+                if current_hrs < 0.5:
+                    entry_thr *= 1.0 + (0.5 - current_hrs) / 0.5
+
+                if (edge_yes is not None and edge_yes > entry_thr and ask_yes is not None and
                         (edge_no is None or edge_yes >= edge_no)):
                     side, edge_val, ask_price, p_side = "YES", edge_yes, ask_yes, p_fair
-                elif edge_no is not None and edge_no > min_edge and ask_no is not None:
+                elif edge_no is not None and edge_no > entry_thr and ask_no is not None:
                     side, edge_val, ask_price, p_side = "NO", edge_no, ask_no, 1.0 - p_fair
 
                 if side is None:
@@ -1407,6 +1955,23 @@ def run(
                 market_mid = mid_yes if side == "YES" else \
                              (round(1.0 - mid_yes, 4) if mid_yes is not None else None)
 
+                # ── Simulation entry delay ─────────────────────────────────────
+                # In simulation (trader=None): on the FIRST poll where edge is found,
+                # place the contract in `pending_by_model` instead of entering
+                # immediately.  On the NEXT poll it is picked up and entered at
+                # that poll's current ask — mimicking the one-poll IOC retry lag
+                # that live trading incurs.  Live trading (trader is not None) uses
+                # the real IOC mechanism instead and skips this path.
+                if trader is None and contract_id not in pending_by_model.get(model_name, {}):
+                    pending_by_model.setdefault(model_name, {})[contract_id] = {
+                        "row": row, "side": side, "p_side": p_side,
+                        "market_mid": market_mid, "edges": edges,
+                    }
+                    seen_set.add(contract_id)   # block re-detection this poll
+                    seen_set.discard(contract_id)  # allow re-evaluation next poll
+                    # Will be processed from pending_by_model at start of next poll
+                    continue
+
                 pos = _create_position(row, model_name, side, ask_price, p_side,
                                        edge_val, market_mid, edges)
 
@@ -1415,10 +1980,15 @@ def run(
                 # A failed or zero-fill BUY means we hold nothing at the exchange.
                 if trader is not None:
                     try:
+                        # Submit 3 cents above quoted ask to absorb staleness.
+                        # IOC fills at actual market price (≤ limit), not the
+                        # inflated limit, so edge calculation remains valid.
+                        buffered_limit = min(round(ask_price + 0.03, 4), 0.99)
                         order = trader.place_order(
                             contract_id = contract_id,
                             side        = side,
                             ask_price   = ask_price,
+                            limit_price = buffered_limit,
                         )
                         if order["filled"] == 0:
                             # IOC with zero fill — no real position, allow retry next poll
@@ -1455,7 +2025,7 @@ def run(
                 open_positions.append(pos)
                 _log_enter(pos)
 
-        _print_summary(now_utc, open_positions, len(closed_positions), ledger_stats)
+        _print_summary(now_utc, open_positions, len(closed_positions), ledger_stats, session_pnl)
 
         # ── Collector health-check: restart any dead subprocesses ───────────
         if not no_collectors:
@@ -1479,12 +2049,20 @@ if __name__ == "__main__":
 
     # Per-model lookback defaults from config
     _lb_defaults = {
-        "gbm":    _lb.get("gbm",    24.0),
-        "ewma":   _lb.get("ewma",   48.0),
-        "garch":  _lb.get("garch",  72.0),
-        "stud":   _lb.get("stud",   48.0),
-        "skt":    _lb.get("skt",    48.0),
-        "heston": _lb.get("heston", 96.0),
+        "gbm":         _lb.get("gbm",         24.0),
+        "ewma":        _lb.get("ewma",        48.0),
+        "garch":       _lb.get("garch",       72.0),
+        "stud":        _lb.get("stud",        48.0),
+        "skt":         _lb.get("skt",         48.0),
+        "heston":      _lb.get("heston",      96.0),
+        "hybrid":      _lb.get("hybrid",      48.0),
+        "ou":          _lb.get("ou",          12.0),
+        "heston_ewma": _lb.get("heston_ewma", 96.0),
+        "gbm_jump":    _lb.get("gbm_jump",    24.0),
+        "ewma_jump":   _lb.get("ewma_jump",   48.0),
+        "garch_jump":  _lb.get("garch_jump",  72.0),
+        "student_t_jump": _lb.get("student_t_jump", 48.0),
+        "hybrid_t_jump":  _lb.get("hybrid_t_jump",  48.0),
     }
 
     parser = argparse.ArgumentParser(
@@ -1498,11 +2076,13 @@ if __name__ == "__main__":
     parser.add_argument("--max-hours-to-settle", type=float, default=_s.get("max_hours_to_settle", 1.5),
                         help="Skip contracts settling more than this many hours away")
     parser.add_argument("--profit-lock",         type=float, default=_ex.get("profit_lock",        0.05),
-                        help="Early exit when bid_now - ask_entry >= this")
-    parser.add_argument("--stop-loss",           type=float, default=_ex.get("stop_loss",          0.10),
-                        help="Early exit when ask_entry - bid_now >= this")
+                        help="Early exit when bid_now - ask_entry >= this (skipped within 30 min of settlement)")
+    parser.add_argument("--stop-loss",           type=float, default=_ex.get("stop_loss",          0.50),
+                        help="Early exit when (ask_entry - bid_now) / ask_entry >= this fraction (e.g. 0.50 = 50%% drawdown)")
     parser.add_argument("--p-drop",              type=float, default=_ex.get("p_drop",             0.05),
                         help="Early exit when model p(side) drops by this from entry")
+    parser.add_argument("--edge-neg-thresh",     type=float, default=_ex.get("edge_neg_thresh",    0.02),
+                        help="edge_closed only fires when edge <= -this (hysteresis; 0 = any negative edge)")
     parser.add_argument("--ewma-lambda",         type=float, default=_s.get("ewma_lambda",         0.94),
                         help="EWMA decay factor λ (RiskMetrics default=0.94)")
     parser.add_argument("--rho",                 type=float, default=_s.get("rho",                 -0.5),
@@ -1520,6 +2100,24 @@ if __name__ == "__main__":
                         help="Skewed-t calibration lookback (hours)")
     parser.add_argument("--lb-heston", type=float, default=_lb_defaults["heston"],
                         help="Heston calibration lookback (hours)")
+    parser.add_argument("--lb-hybrid", type=float, default=_lb_defaults["hybrid"],
+                        help="Hybrid EWMA-t calibration lookback (hours)")
+    parser.add_argument("--lb-ou", type=float, default=_lb_defaults["ou"],
+                        help="OU log-price mean-reversion lookback (hours)")
+    parser.add_argument("--lb-heston-ewma", type=float, default=_lb_defaults["heston_ewma"],
+                        help="Heston-EWMA calibration lookback (hours)")
+    parser.add_argument("--lb-gbm-jump",      type=float, default=_lb_defaults["gbm_jump"],
+                        help="GBM+Jump calibration lookback (hours)")
+    parser.add_argument("--lb-ewma-jump",     type=float, default=_lb_defaults["ewma_jump"],
+                        help="EWMA+Jump calibration lookback (hours)")
+    parser.add_argument("--lb-garch-jump",    type=float, default=_lb_defaults["garch_jump"],
+                        help="GARCH+Jump calibration lookback (hours)")
+    parser.add_argument("--lb-stud-jump",     type=float, default=_lb_defaults["student_t_jump"],
+                        help="StudentT+Jump calibration lookback (hours)")
+    parser.add_argument("--lb-hybrid-jump",   type=float, default=_lb_defaults["hybrid_t_jump"],
+                        help="HybridT+Jump calibration lookback (hours)")
+    parser.add_argument("--vol-veto-mult",    type=float, default=_s.get("vol_veto_mult", 2.0),
+                        help="Block entry when 10-min realized vol > this × EWMA vol (0=off)")
     parser.add_argument("--no-collectors", action="store_true",
                         help="Do not auto-start getdata_underlying / getdata_prediction_contract")
     args = parser.parse_args()
@@ -1527,12 +2125,20 @@ if __name__ == "__main__":
     run(
         poll_sec            = args.poll_sec,
         lookbacks           = {
-            "gbm":    args.lb_gbm,
-            "ewma":   args.lb_ewma,
-            "garch":  args.lb_garch,
-            "stud":   args.lb_stud,
-            "skt":    args.lb_skt,
-            "heston": args.lb_heston,
+            "gbm":           args.lb_gbm,
+            "ewma":          args.lb_ewma,
+            "garch":         args.lb_garch,
+            "stud":          args.lb_stud,
+            "skt":           args.lb_skt,
+            "heston":        args.lb_heston,
+            "hybrid":        args.lb_hybrid,
+            "ou":            args.lb_ou,
+            "heston_ewma":   args.lb_heston_ewma,
+            "gbm_jump":      args.lb_gbm_jump,
+            "ewma_jump":     args.lb_ewma_jump,
+            "garch_jump":    args.lb_garch_jump,
+            "student_t_jump":args.lb_stud_jump,
+            "hybrid_t_jump": args.lb_hybrid_jump,
         },
         min_edge            = args.min_edge,
         max_hours_to_settle = args.max_hours_to_settle,
@@ -1541,5 +2147,7 @@ if __name__ == "__main__":
         p_drop              = args.p_drop,
         ewma_lambda         = args.ewma_lambda,
         rho                 = args.rho,
+        edge_neg_thresh     = args.edge_neg_thresh,
+        vol_veto_mult       = args.vol_veto_mult,
         no_collectors       = args.no_collectors,
     )

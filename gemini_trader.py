@@ -45,6 +45,7 @@ import time
 from typing import Optional
 
 import requests
+from requests import HTTPError
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -56,7 +57,6 @@ _BASE_SANDBOX = "https://api.sandbox.gemini.com"
 _EVENTS_PATH    = "/v1/prediction-markets/events"
 _ORDER_PATH     = "/v1/prediction-markets/order"
 _CANCEL_PATH    = "/v1/prediction-markets/order/cancel"
-_STATUS_PATH    = "/v1/prediction-markets/order/status"
 _POSITIONS_PATH = "/v1/prediction-markets/positions"
 
 
@@ -103,25 +103,31 @@ class GeminiTrader:
         self._symbol_cache: dict[str, str] = {}
         self._cache_ts: float = 0.0         # epoch seconds of last full refresh
 
-        # Monotonically-increasing nonce — prevents collision when multiple orders
-        # are placed within the same millisecond (e.g., multi-model burst entries).
+        # Monotonically-increasing nonce in EPOCH SECONDS.
+        # Prediction-market private endpoints reject nonces that are not within
+        # ~30 seconds of server time, so millisecond nonces are too large.
         self._nonce_lock = threading.Lock()
         self._last_nonce: int = 0
 
     # ── HMAC Auth ─────────────────────────────────────────────────────────────
 
     def _next_nonce(self) -> int:
-        """Return a strictly-increasing millisecond nonce.
+        """Return a strictly-increasing nonce in epoch seconds.
 
-        Falls back to last_nonce+1 if two calls happen within the same
-        millisecond — prevents nonce-collision rejections under burst flow.
+        Gemini prediction-market private APIs validate nonce against server
+        wall-clock seconds (must be close to current time), so we keep nonce
+        in seconds and monotonic. If burst traffic pushes nonce too far ahead,
+        wait briefly to stay inside the acceptance window.
         """
         with self._nonce_lock:
-            candidate = int(time.time() * 1000)
-            if candidate <= self._last_nonce:
-                candidate = self._last_nonce + 1
-            self._last_nonce = candidate
-            return candidate
+            while True:
+                now_sec = int(time.time())
+                candidate = now_sec if now_sec > self._last_nonce else self._last_nonce + 1
+                # Keep some headroom under the server's ±30s guard.
+                if candidate <= now_sec + 25:
+                    self._last_nonce = candidate
+                    return candidate
+                time.sleep(1.0)
 
     def _signed_headers(self, endpoint: str, params: dict) -> dict:
         """Return the three X-GEMINI-* headers for a private POST request."""
@@ -142,7 +148,16 @@ class GeminiTrader:
     def _post(self, endpoint: str, params: dict | None = None) -> dict:
         headers = self._signed_headers(endpoint, params or {})
         r = self.session.post(self.base_url + endpoint, headers=headers, timeout=15)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except HTTPError as exc:
+            try:
+                body = r.json()
+            except Exception:
+                body = r.text
+            raise RuntimeError(
+                f"Gemini API POST {endpoint} failed ({r.status_code}): {body}"
+            ) from exc
         return r.json()
 
     # ── Symbol cache (contract_id → instrumentSymbol) ─────────────────────────
@@ -196,11 +211,13 @@ class GeminiTrader:
         side:        str,          # "YES" or "NO"
         ask_price:   float,        # e.g. 0.09  (9 cents per contract)
         bet_dollars: Optional[float] = None,
+        limit_price: Optional[float] = None,  # optional aggressive limit >= ask
     ) -> dict:
         """Place a limit IOC buy order for ~bet_dollars worth of YES/NO contracts.
 
         Uses ``immediate-or-cancel`` so the order fills at or better than
-        ``ask_price`` and any unfilled remainder is cancelled automatically —
+        ``limit_price`` (defaults to ``ask_price``) and any unfilled remainder
+        is cancelled automatically —
         no dangling GTC resting orders.
 
         Parameters
@@ -211,6 +228,9 @@ class GeminiTrader:
             ``"YES"`` or ``"NO"`` — which outcome to buy.
         ask_price:
             Current best ask for the chosen side (0.0–1.0 scale, e.g. 0.09).
+        limit_price:
+            Price sent to Gemini as IOC limit price.  If None, uses ask_price.
+            Use a small premium above ask_price when you want higher fill odds.
         bet_dollars:
             Target notional.  Defaults to ``self.bet_dollars`` (20.0).
 
@@ -230,7 +250,13 @@ class GeminiTrader:
             raise ValueError(
                 f"[trader] Invalid ask_price={ask_price!r}: must be a positive float."
             )
-        n_contracts = max(1, int(dollars / ask_price))
+        px = float(limit_price if limit_price is not None else ask_price)
+        if px <= 0 or px > 1:
+            raise ValueError(
+                f"[trader] Invalid limit_price={px!r}: must be in (0, 1]."
+            )
+        # Size off limit price so we don't exceed target spend in worst-case fill.
+        n_contracts = max(1, int(dollars / px))
 
         symbol = self.resolve_symbol(contract_id)
         if not symbol:
@@ -244,7 +270,7 @@ class GeminiTrader:
             "orderType":   "limit",
             "side":        "buy",
             "outcome":     side.lower(),              # "yes" or "no"
-            "price":       str(round(ask_price, 4)),
+            "price":       str(round(px, 4)),
             "quantity":    str(n_contracts),
             "timeInForce": "immediate-or-cancel",     # fill & kill; no GTC remainder
         }
@@ -269,7 +295,7 @@ class GeminiTrader:
                 except (TypeError, ValueError):
                     pass
 
-        fill_price = avg_price if avg_price is not None else ask_price
+        fill_price = avg_price if avg_price is not None else px
 
         return {
             "order_id":    order_id,
@@ -277,6 +303,7 @@ class GeminiTrader:
             "bet_dollars": round(n_contracts * fill_price, 4),
             "filled":      filled,
             "avg_price":   avg_price,   # None if API doesn't return it
+            "limit_price": round(px, 4),
             "status":      status,
             "symbol":      symbol,
             "raw":         resp,
@@ -348,8 +375,19 @@ class GeminiTrader:
         return self._post(_CANCEL_PATH, {"orderId": order_id})
 
     def get_order_status(self, order_id: int) -> dict:
-        """Fetch the current state of an order."""
-        return self._post(_STATUS_PATH, {"orderId": order_id})
+        """Best-effort order status snapshot.
+
+        Gemini prediction-markets currently does not expose
+        `/v1/prediction-markets/order/status` (returns EndpointNotFound).
+        As a fallback, return a positions snapshot so callers can verify
+        whether exposure exists after submitting an IOC order.
+        """
+        return {
+            "order_id": order_id,
+            "status_supported": False,
+            "message": "Prediction-markets order status endpoint is unavailable; using positions snapshot.",
+            "positions": self.get_positions(),
+        }
 
     def get_positions(self) -> list[dict]:
         """Return a list of open prediction-market positions."""
@@ -357,3 +395,10 @@ class GeminiTrader:
         if isinstance(resp, list):
             return resp
         return resp.get("positions", [])
+
+    def get_balances(self) -> list[dict]:
+        """Return account balances (USD cash + any crypto held).
+
+        Response is a list of dicts with keys: currency, amount, available.
+        """
+        return self._post("/v1/account/balances")

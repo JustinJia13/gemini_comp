@@ -29,6 +29,28 @@ Model family 6 — Heston stochastic volatility:
     V₀, kappa, theta, xi calibrated from 1-min returns; rho from elastic-net
     regression of Δvol on returns.  Priced via vectorised Monte Carlo
     (full-truncation Euler scheme, 1-min steps).
+
+Model family 7 — Hybrid EWMA-sigma + Student's t (regime-aware fat tails):
+    sigma from EWMA (regime-responsive); nu from kurtosis of EWMA-normalised
+    residuals.  Fixes equal-weight MLE dilution during fast vol moves.
+
+Model family 8 — Ornstein-Uhlenbeck on log-price:
+    d(ln S) = kappa (mu_ln - ln S) dt + sigma dW
+    Conditional distribution of ln S_T is Gaussian — closed-form pricing.
+    Captures short-term mean reversion in BTC around recent trend.
+
+Model family 9 — Heston with EWMA-calibrated variance:
+    Same SDE as Heston but theta estimated from EWMA-smoothed hourly variances.
+
+Model family 10 — Merton Jump-Diffusion overlay (5 variants):
+    gbm_jump | ewma_jump | garch_jump | student_t_jump | hybrid_t_jump
+    Each variant reuses the base model's sigma_diff/mu calibration and adds
+    Poisson-Gaussian jump calibration via `calibrate_jumps_from_log_returns`.
+    Priced with the Merton (1976) series: P = Σ p_n Φ(d_n).
+    Same SDE as Heston but theta (long-run variance) and the kappa/xi AR(1)
+    are estimated on an EWMA-smoothed hourly variance series (lambda_h=0.9).
+    Makes the model responsive to current vol regime instead of equal-weight
+    96-hour history.  Reuses HestonParams and heston_binary_prob.
 """
 
 from __future__ import annotations
@@ -762,6 +784,512 @@ def _minute_log_returns_before(
     if len(closes) < 2:
         return np.array([])
     return np.log(closes.values[1:] / closes.values[:-1])
+
+
+# ---------------------------------------------------------------------------
+# Model family 7 — Hybrid EWMA-σ + Student's t  (regime-aware fat tails)
+# ---------------------------------------------------------------------------
+#
+# Motivation: pure Student's t uses equal-weight MLE over the full lookback
+# window, so its σ adapts slowly when vol spikes (e.g. a sudden BTC move).
+# EWMA reacts instantly but assumes Gaussian tails.
+#
+# Hybrid_t takes the best of both:
+#   • σ  — EWMA conditional vol (already computed, decay-weighted by λ=0.94)
+#           Responds immediately to current vol regime.
+#   • ν  — degrees of freedom from kurtosis of EWMA-normalised residuals.
+#           Capturing the *shape* of the tail distribution independently of
+#           scale lets us get fat-tail pricing without sacrificing responsiveness.
+#   • μ  — drift from EWMA params (consistent with σ).
+#
+# Pricing: Monte Carlo — same as student_t_binary_prob but σ = EWMA σ.
+
+@dataclass
+class HybridTParams:
+    """Hybrid EWMA-sigma + Student's t model parameters.
+
+    Attributes:
+        sigma_per_sqrt_hour: EWMA conditional vol (per-sqrt-hour). Responsive
+            to current regime — updates on every new 1-min bar.
+        nu: Student's t degrees of freedom, fit from kurtosis of the EWMA-
+            normalised residuals.  Captures tail shape independently of scale.
+        mu_per_hour: GBM-consistent drift from EWMA params.
+    """
+    sigma_per_sqrt_hour: float
+    nu:                  float
+    mu_per_hour:         float
+
+
+def calibrate_hybrid_t_from_log_returns(
+    log_returns: np.ndarray,
+    ewma_params: EWMAParams,
+    dt_hours: float = 1 / 60,
+) -> HybridTParams:
+    """Calibrate Hybrid EWMA-σ + Student's t model.
+
+    Steps:
+    1. σ taken directly from ewma_params (already computed, decay-weighted).
+    2. Standardise each 1-min return by the running EWMA σ at that bar.
+       This strips the EWMA vol signal, leaving only the tail shape.
+    3. Fit ν from kurtosis of the standardised residuals.
+
+    Parameters
+    ----------
+    log_returns:
+        Array of 1-min log returns (same window used for EWMA calibration).
+    ewma_params:
+        Already-calibrated EWMA params for the same window.
+    dt_hours:
+        Length of one bar in hours (default 1/60 for 1-min bars).
+    """
+    r = np.asarray(log_returns, dtype=float)
+    if r.size < 5:
+        raise ValueError("Need at least 5 returns for hybrid_t calibration")
+
+    lam = ewma_params.lambda_
+
+    # Reproduce the EWMA variance recursion to get per-bar conditional σ.
+    var = float(np.var(r))
+    ewma_vars = np.empty(len(r))
+    for i, ret in enumerate(r):
+        var = lam * var + (1.0 - lam) * ret ** 2
+        ewma_vars[i] = max(var, 1e-18)
+
+    # Convert per-bar variance to per-sqrt-hour σ for standardising returns.
+    ewma_sigma_bar = np.sqrt(ewma_vars / dt_hours)   # per-sqrt-hour at each bar
+    # 1-min return std = σ_per_sqrt_hour * sqrt(dt_hours)
+    ewma_scale_bar = ewma_sigma_bar * np.sqrt(dt_hours)
+    ewma_scale_bar = np.where(ewma_scale_bar < 1e-9, 1e-9, ewma_scale_bar)
+
+    # Standardised residuals: if model is correct, these ~ t(ν, 0, 1).
+    z = r / ewma_scale_bar
+
+    # Fit ν from kurtosis of standardised residuals (same closed-form as student_t).
+    g2 = _sample_excess_kurtosis(z)
+    if g2 > 1e-6:
+        nu = float(np.clip(6.0 / g2 + 4.0, 4.1, 200.0))
+    else:
+        nu = 200.0
+
+    return HybridTParams(
+        sigma_per_sqrt_hour = ewma_params.sigma_per_sqrt_hour,
+        nu                  = nu,
+        mu_per_hour         = ewma_params.mu_per_hour,
+    )
+
+
+def hybrid_t_binary_prob(
+    trade_price:   float,
+    strike_price:  float,
+    params:        HybridTParams,
+    horizon_hours: float = 1.0,
+    direction:     Direction = "above",
+    n_sims:        int = 20_000,
+    seed:          Optional[int] = 7,
+) -> float:
+    """Price binary contract via Monte Carlo under the Hybrid EWMA-σ + t model.
+
+    Identical structure to student_t_binary_prob but uses EWMA σ (current
+    regime vol) and hybrid ν (tail shape from EWMA-standardised residuals).
+    The 1-hour log return is modelled as:
+        r_1h ~ loc + σ_1h * z,   z ~ t(ν)  rescaled to unit variance
+    where σ_1h = σ_ewma * sqrt(horizon_hours)  and  loc = (μ - σ²/2) * t.
+    """
+    if trade_price <= 0 or strike_price <= 0:
+        raise ValueError("Prices must be positive")
+
+    sigma = max(params.sigma_per_sqrt_hour, 1e-12)
+    t     = horizon_hours
+    loc   = (params.mu_per_hour - 0.5 * sigma * sigma) * t
+    scale = sigma * sqrt(t)
+
+    rng = np.random.default_rng(seed)
+    raw = rng.standard_t(df=params.nu, size=n_sims)
+    z   = raw * sqrt((params.nu - 2.0) / params.nu)   # rescale to unit variance
+
+    lr       = loc + scale * z
+    terminal = trade_price * np.exp(lr)
+    p_above  = float(np.mean(terminal > strike_price))
+    return p_above if direction == "above" else float(1.0 - p_above)
+
+
+# ---------------------------------------------------------------------------
+# Model family 8 — Ornstein-Uhlenbeck on log-price
+# ---------------------------------------------------------------------------
+#
+# d(ln S) = κ(μ - ln S) dt + σ dW
+#
+# Captures BTC's tendency to revert toward a short-term equilibrium between
+# large directional moves.  Unlike GBM (which treats every minute as fresh
+# diffusion), OU says "price is currently above/below where it gravitates;
+# price the contract accordingly."
+#
+# Closed-form: ln S_T | ln S_0 ~ N(m_T, v_T)
+#   m_T = μ + (ln S_0 - μ) * exp(-κ T)
+#   v_T = σ² * (1 - exp(-2κT)) / (2κ)    (GBM limit when κ → 0)
+#
+# Calibration via AR(1) regression on log-prices:
+#   ln S_t = a + b * ln S_{t-1} + ε
+#   b   = exp(-κ dt)  →  κ = -ln(b) / dt
+#   a   = μ (1 - b)   →  μ = a / (1 - b)
+#   σ²  = Var(ε) / dt
+#
+# Short lookback (12-24 h) works best; OU captures LOCAL mean reversion.
+# With very low κ (near-unit-root), the model degenerates to GBM — safe.
+
+@dataclass
+class OUParams:
+    """Ornstein-Uhlenbeck parameters for log-price mean reversion.
+
+    Attributes:
+        kappa     : Mean-reversion speed (per hour). Large κ = strong pull.
+        mu_ln     : Long-run mean of ln(S). The level prices revert toward.
+        sigma     : Diffusion (per-sqrt-hour) — same units as GBM sigma.
+        ln_s0     : Current ln(spot price) — the starting point for pricing.
+    """
+    kappa: float
+    mu_ln: float
+    sigma: float
+    ln_s0: float
+
+
+def calibrate_ou_from_closes(
+    closes: np.ndarray,
+    dt_hours: float = 1 / 60,
+) -> OUParams:
+    """Calibrate OU parameters from close price series via AR(1) on log-prices.
+
+    Parameters
+    ----------
+    closes:
+        Array of close prices (1-minute bars from the lookback window).
+    dt_hours:
+        Bar length in hours (1/60 for 1-min bars).
+    """
+    c = np.asarray(closes, dtype=float)
+    if len(c) < 10:
+        raise ValueError("Need at least 10 closes for OU calibration")
+
+    ln_c = np.log(c)
+    x = ln_c[:-1]
+    y = ln_c[1:]
+
+    xm = float(np.mean(x))
+    ym = float(np.mean(y))
+    cov_xy = float(np.sum((x - xm) * (y - ym)))
+    var_x  = float(np.sum((x - xm) ** 2))
+
+    if var_x < 1e-20:
+        raise ValueError("Degenerate log-price series (zero variance)")
+
+    # AR(1) coefficient b = exp(-kappa * dt); clip to (0, 1) for mean reversion.
+    b = float(np.clip(cov_xy / var_x, 1e-6, 0.9999))
+    a = ym - b * xm
+
+    kappa = max(-np.log(b) / dt_hours, 0.01)   # floor: at least 0.01/h reversion
+    mu_ln = a / (1.0 - b)
+
+    residuals = y - (a + b * x)
+    sigma = sqrt(max(float(np.var(residuals, ddof=1)) / dt_hours, 1e-18))
+
+    return OUParams(
+        kappa = kappa,
+        mu_ln = float(mu_ln),
+        sigma = sigma,
+        ln_s0 = float(ln_c[-1]),   # caller should override with log(live spot)
+    )
+
+
+def ou_binary_prob(
+    trade_price:   float,
+    strike_price:  float,
+    params:        OUParams,
+    horizon_hours: float = 1.0,
+    direction:     Direction = "above",
+) -> float:
+    """Price binary contract under the OU log-price model (closed form).
+
+    ln S_T | ln S_0 ~ N(m_T, v_T):
+      m_T = mu_ln + (ln_s0 - mu_ln) * exp(-kappa * T)
+      v_T = sigma^2 * (1 - exp(-2*kappa*T)) / (2*kappa)
+          → sigma^2 * T  when kappa → 0  (GBM limit)
+    """
+    if trade_price <= 0 or strike_price <= 0:
+        raise ValueError("Prices must be positive")
+
+    T     = horizon_hours
+    kappa = max(params.kappa, 1e-6)
+    e_kt  = float(np.exp(-kappa * T))
+
+    m_T = params.mu_ln + (params.ln_s0 - params.mu_ln) * e_kt
+
+    if kappa < 1e-4:
+        v_T = params.sigma ** 2 * T        # GBM limit
+    else:
+        v_T = params.sigma ** 2 * (1.0 - float(np.exp(-2.0 * kappa * T))) / (2.0 * kappa)
+    v_T = max(v_T, 1e-18)
+
+    x = (np.log(strike_price) - m_T) / sqrt(v_T)
+    p_above = float(1.0 - _normal_cdf(x))
+    return p_above if direction == "above" else float(1.0 - p_above)
+
+
+def _minute_closes_before(
+    minute_df: pd.DataFrame,
+    before_time,
+    lookback_hours: float,
+) -> np.ndarray:
+    """Raw close prices in the window (before_time - lookback_hours, before_time)."""
+    start = before_time - pd.Timedelta(hours=lookback_hours)
+    closes = minute_df.loc[
+        (minute_df.index > start) & (minute_df.index < before_time), "close"
+    ].dropna()
+    return closes.values.astype(float)
+
+
+# ---------------------------------------------------------------------------
+# Model family 9 — Heston with EWMA-calibrated variance
+# ---------------------------------------------------------------------------
+#
+# Same SDE as Model 6 but the long-run variance theta is computed as the
+# terminal EWMA of hourly realised variances (lambda_h=0.9 per hourly bar,
+# half-life ≈ 6-7 hours) instead of an equal-weight 96-hour mean.
+#
+# Motivation: during a vol spike, the equal-weight theta underestimates the
+# current regime, causing the model to expect rapid reversion to a low
+# long-run vol.  EWMA-theta reflects "the long-run average has recently
+# been higher" — producing fatter tails and more conservative probabilities
+# when BTC is moving fast.
+#
+# kappa and xi are also estimated from the EWMA-smoothed hourly variance
+# series so the AR(1) persistence reflects recent behaviour, not the last
+# 96h equally.  v0 is unchanged (already EWMA from 1-min bars).
+#
+# Pricing reuses heston_binary_prob unchanged.
+
+def calibrate_heston_ewma_from_log_returns(
+    log_returns: np.ndarray,
+    rho: Optional[float] = None,
+    dt_hours: float = 1 / 60,
+    lambda_h: float = 0.9,
+) -> HestonParams:
+    """Calibrate Heston with EWMA-weighted hourly variance for theta/kappa/xi.
+
+    Parameters
+    ----------
+    log_returns:
+        1-minute log returns from the lookback window (need ≥ 300 returns
+        = 5 hourly windows).
+    rho:
+        Optional price-vol correlation prior.  Estimated from data if None.
+    dt_hours:
+        Bar length in hours (1/60 for 1-min bars).
+    lambda_h:
+        EWMA decay per hourly bar (default 0.9 → half-life ≈ 6.6 hours).
+        Higher = slower decay = more weight on older hourly variances.
+    """
+    r = np.asarray(log_returns, dtype=float)
+    n_windows = len(r) // 60
+    if n_windows < 5:
+        raise ValueError(
+            f"Need at least 300 log-returns (5 hourly windows) for Heston-EWMA; got {len(r)}"
+        )
+
+    # ── Hourly realised variances (equal-weight within each hour) ──────────
+    h_var = np.array([
+        np.var(r[i * 60: (i + 1) * 60]) / dt_hours
+        for i in range(n_windows)
+    ])
+
+    # ── EWMA of hourly variances (lambda_h per hourly bar) ─────────────────
+    ewma_hvar = np.empty(len(h_var))
+    ewma_hvar[0] = h_var[0]
+    for i in range(1, len(h_var)):
+        ewma_hvar[i] = lambda_h * ewma_hvar[i - 1] + (1.0 - lambda_h) * h_var[i]
+
+    # theta = terminal EWMA value = regime-aware long-run mean variance
+    theta = max(float(ewma_hvar[-1]), 1e-12)
+
+    # ── v0: EWMA terminal variance (per-hour) from 1-min bars ──────────────
+    var_ewma = float(np.var(r))
+    lam_m = 0.94
+    for ret in r:
+        var_ewma = lam_m * var_ewma + (1.0 - lam_m) * ret ** 2
+    v0 = max(var_ewma / dt_hours, 1e-12)
+
+    # ── kappa + xi from AR(1) on EWMA-smoothed hourly variance series ───────
+    x_ar = ewma_hvar[:-1]
+    y_ar = ewma_hvar[1:]
+    xm, ym = float(np.mean(x_ar)), float(np.mean(y_ar))
+    cov_xy = float(np.sum((x_ar - xm) * (y_ar - ym)))
+    var_x  = float(np.sum((x_ar - xm) ** 2))
+
+    if var_x > 1e-20:
+        b = float(np.clip(cov_xy / var_x, 0.01, 0.9999))
+    else:
+        b = 0.85
+
+    a         = ym - b * xm
+    residuals = y_ar - (a + b * x_ar)
+    kappa     = max(float(-np.log(b)), 0.5)
+    xi        = float(np.std(residuals)) / max(sqrt(theta), 1e-9)
+    xi        = max(xi, 0.01)
+
+    # ── Feller condition ────────────────────────────────────────────────────
+    feller_xi_max = sqrt(2.0 * kappa * theta) * 0.99
+    xi = min(xi, feller_xi_max)
+
+    if rho is None:
+        rho = estimate_price_vol_rho(r)
+
+    return HestonParams(
+        v0    = v0,
+        kappa = kappa,
+        theta = theta,
+        xi    = xi,
+        rho   = float(np.clip(rho, -0.99, 0.99)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Model family 10 — Merton Jump-Diffusion overlay
+# ---------------------------------------------------------------------------
+# Any base model provides sigma_diff (diffusion vol) and mu (drift).
+# Jump calibration separates the large tail moves from continuous diffusion,
+# then prices the binary using the Merton (1976) series expansion:
+#
+#   P(S_T > K) = Σ_{n=0}^{N} p_n · Φ(d_n)
+#   p_n = e^{-λT}(λT)^n / n!   (Poisson weight for n jumps)
+#   d_n = [ln(S₀/K) + (μ - σ²/2 - λk̄)T + n·μ_J] / sqrt(σ²T + n·σ_J²)
+#   k̄   = exp(μ_J + σ_J²/2) − 1   (expected relative jump size)
+#
+# Jump detection: classify |r_t − μ| > threshold · σ_total as jumps,
+# calibrate (λ, μ_J, σ_J) from those returns, fit σ_diff from the rest.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class JumpParams:
+    """Merton jump-diffusion calibration result.
+
+    Attributes:
+        lambda_j:   Jump arrival rate (jumps per hour).
+        mu_j:       Mean log-jump size (log(S+/S-)) per jump event.
+        sigma_j:    Std of log-jump size per jump event.
+        sigma_diff: Diffusion-only sigma (per sqrt-hour) after stripping jumps.
+        mu_diff:    Diffusion-only drift (per hour) after stripping jumps.
+    """
+    lambda_j:   float
+    mu_j:       float
+    sigma_j:    float
+    sigma_diff: float
+    mu_diff:    float
+
+
+def calibrate_jumps_from_log_returns(
+    log_returns: np.ndarray,
+    dt_hours: float = 1 / 60,
+    threshold_sigma: float = 3.0,
+) -> "JumpParams | None":
+    """Separate jumps from diffusion using a sigma-threshold filter.
+
+    Returns None when there are too few returns or too few detected jumps
+    to estimate jump parameters reliably.
+    """
+    if len(log_returns) < 30:
+        return None
+
+    mu_all  = float(np.mean(log_returns))
+    sig_all = float(np.std(log_returns))
+    if sig_all < 1e-12:
+        return None
+
+    jump_mask = np.abs(log_returns - mu_all) > threshold_sigma * sig_all
+    jumps     = log_returns[jump_mask]
+    diffusion = log_returns[~jump_mask]
+
+    if len(jumps) < 2 or len(diffusion) < 20:
+        return None  # too few jumps to estimate — treat as pure diffusion
+
+    mu_j    = float(np.mean(jumps))
+    sigma_j = max(float(np.std(jumps)), abs(mu_j) * 0.1 + 1e-8)
+
+    T_hours  = len(log_returns) * dt_hours
+    lambda_j = len(jumps) / T_hours          # jumps per hour
+
+    mu_diff    = float(np.mean(diffusion)) / dt_hours      # per hour
+    sigma_diff = float(np.std(diffusion))  / sqrt(dt_hours) # per sqrt-hour
+    if sigma_diff < 1e-10:
+        return None
+
+    return JumpParams(
+        lambda_j   = max(lambda_j, 0.0),
+        mu_j       = mu_j,
+        sigma_j    = sigma_j,
+        sigma_diff = sigma_diff,
+        mu_diff    = mu_diff,
+    )
+
+
+def merton_binary_prob(
+    spot:             float,
+    strike:           float,
+    direction:        "Direction",
+    horizon_hours:    float,
+    sigma_diff:       float,   # per sqrt-hour (from base model)
+    mu_hourly:        float,   # per hour (from base model)
+    jump_params:      "JumpParams",
+    n_terms:          int = 25,
+) -> float:
+    """Merton (1976) jump-diffusion probability P(S_T > K).
+
+    Uses the base model's sigma_diff and mu_hourly for the diffusion component;
+    overlays the Poisson-Gaussian jump compound from jump_params.
+
+    Args:
+        sigma_diff:  Diffusion sigma per sqrt-hour (NOT annualised).
+        mu_hourly:   Log-drift per hour (not adjusted for jumps).
+        n_terms:     Truncation of the Poisson sum (25 is sufficient for λT ≤ 5).
+    """
+    from scipy.stats import norm as _norm
+
+    T   = horizon_hours
+    lam = jump_params.lambda_j
+    mj  = jump_params.mu_j
+    sj  = jump_params.sigma_j
+    s2  = sigma_diff ** 2            # variance per hour
+
+    # k̄ = E[e^J − 1] = exp(μ_J + σ_J²/2) − 1
+    k_bar = float(np.expm1(mj + 0.5 * sj ** 2))
+
+    # Drift of log-price per hour adjusted for Poisson compensation term
+    mu_adj = mu_hourly - 0.5 * s2 - lam * k_bar
+
+    log_ratio = log(max(spot / strike, 1e-12))
+    lam_T     = lam * T
+
+    prob = 0.0
+    # Pre-compute e^{-λT} once; build Poisson weights iteratively
+    poisson_weight = float(np.exp(-lam_T))  # n=0 term
+
+    for n in range(n_terms):
+        var_n = s2 * T + n * sj ** 2
+        if var_n <= 0:
+            if n > 0:
+                break
+            poisson_weight *= lam_T / max(n, 1)
+            continue
+        std_n = sqrt(var_n)
+        mean_n = mu_adj * T + n * mj
+        d_n   = (log_ratio + mean_n) / std_n
+        prob  += poisson_weight * float(_norm.cdf(d_n))
+        # Next Poisson weight: p_{n+1} = p_n * λT / (n+1)
+        poisson_weight *= lam_T / (n + 1)
+        if poisson_weight < 1e-10:
+            break   # tail of Poisson sum is negligible
+
+    prob = float(np.clip(prob, 1e-6, 1.0 - 1e-6))
+    return prob if direction in ("above", "HI") else 1.0 - prob
 
 
 # ---------------------------------------------------------------------------
