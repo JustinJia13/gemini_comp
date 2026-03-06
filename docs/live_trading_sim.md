@@ -275,5 +275,5 @@ is conservatively recorded at $0.
 **Order mechanics:**
 - IOC (immediate-or-cancel) only — no resting GTC orders
 - Entry: `floor(bet_dollars / ask_price)` contracts
-- Entry price: `ask + 0.03` buffer to absorb stale-CSV spread
+- Entry price: `ask + 0.05` buffer to absorb stale-CSV spread (IOC fills at true market ask, not the limit)
 - Partial IOC fills: unsold contracts stay open and are retried next poll; final PnL blends partial and full-exit legs
