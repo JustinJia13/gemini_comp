@@ -216,6 +216,26 @@ EDGE_FIELDS = [
 ]
 
 
+# Maps model_name (as used in trades CSV / active_models list) → p_key used
+# in _compute_edges result dict (e.g. "p_fair_{p_key}").  Referenced in the
+# entry loop (confidence computation) and in _check_early_exit.
+_MODEL_TO_PKEY: dict[str, str] = {
+    "gbm":            "gbm",
+    "ewma":           "ewma",
+    "garch":          "garch",
+    "student_t":      "stud",
+    "skewed_t":       "skt",
+    "heston":         "heston",
+    "hybrid_t":       "hybrid",
+    "ou":             "ou",
+    "heston_ewma":    "heston_ewma",
+    "gbm_jump":       "gbm_jump",
+    "ewma_jump":      "ewma_jump",
+    "garch_jump":     "garch_jump",
+    "student_t_jump": "stud_jump",
+    "hybrid_t_jump":  "hybrid_jump",
+}
+
 # ---------------------------------------------------------------------------
 # I/O helpers
 # ---------------------------------------------------------------------------
@@ -695,6 +715,25 @@ def _compute_edges(
         result[f"edge_yes_{key}"] = round(p - ask_yes, 4)        if ask_yes is not None else None
         result[f"edge_no_{key}"]  = round((1.0 - p) - ask_no, 4) if ask_no  is not None else None
 
+    # ── Data confidence: fraction of the lookback window actually filled ──────
+    # 1.0 = window fully populated; < 1.0 = OHLCV gap reduces reliability.
+    # Penalises missing data, NOT short lookback windows (that's a deliberate
+    # design choice for regime adaptation, not a data-quality problem).
+    result["data_conf_gbm"]          = min(1.0, len(min_lr_gbm)               / max(1, lb_gbm         * 60))
+    result["data_conf_ewma"]         = min(1.0, len(_get_lr(lb_ewma))         / max(1, lb_ewma        * 60))
+    result["data_conf_garch"]        = min(1.0, len(_get_lr(lb_garch))        / max(1, lb_garch       * 60))
+    result["data_conf_stud"]         = min(1.0, len(_get_lr(lb_stud))         / max(1, lb_stud        * 60))
+    result["data_conf_skt"]          = min(1.0, len(_get_lr(lb_skt))          / max(1, lb_skt         * 60))
+    result["data_conf_heston"]       = min(1.0, len(_get_lr(lb_heston))       / max(1, lb_heston      * 60))
+    result["data_conf_hybrid"]       = min(1.0, len(_get_lr(lb_hybrid))       / max(1, lb_hybrid      * 60))
+    result["data_conf_ou"]           = min(1.0, len(_get_lr(lb_ou))           / max(1, lb_ou          * 60))
+    result["data_conf_heston_ewma"]  = min(1.0, len(_get_lr(lb_heston_ewma))  / max(1, lb_heston_ewma * 60))
+    result["data_conf_gbm_jump"]     = min(1.0, len(_get_lr(lb_jump))         / max(1, lb_jump        * 60))
+    result["data_conf_ewma_jump"]    = min(1.0, len(_get_lr(lb_jump_ewma))    / max(1, lb_jump_ewma   * 60))
+    result["data_conf_garch_jump"]   = min(1.0, len(_get_lr(lb_jump_garch))   / max(1, lb_jump_garch  * 60))
+    result["data_conf_stud_jump"]    = min(1.0, len(_get_lr(lb_jump_stud))    / max(1, lb_jump_stud   * 60))
+    result["data_conf_hybrid_jump"]  = min(1.0, len(_get_lr(lb_jump_hybrid))  / max(1, lb_jump_hybrid * 60))
+
     return result
 
 
@@ -780,6 +819,7 @@ def _check_early_exit(
     edge_neg_thresh: float = 0.0,
     vol_veto_mult: float = 2.0,
     precomputed_edges: dict | None = None,
+    conf_active: list[str] | None = None,  # for ensemble p_fair recomputation at exit
 ) -> dict | None:
     """Check whether an open position should be closed before settlement.
 
@@ -879,8 +919,20 @@ def _check_early_exit(
                     "student_t_jump":"stud_jump",
                     "hybrid_t_jump": "hybrid_jump",
                 }
-                p_key = _p_key_map.get(pos["model"], "gbm")
-                p_fair_now = edges[f"p_fair_{p_key}"]
+                if pos["model"] == "ensemble":
+                    # Recompute true ensemble p_fair from conf_active models.
+                    # All 14 model p_fairs are available in edges; take the mean
+                    # of whichever conf_active models have a result.
+                    _eff = conf_active if conf_active else list(_MODEL_TO_PKEY.keys())
+                    _exit_pfairs = [
+                        float(edges[f"p_fair_{_MODEL_TO_PKEY[mn]}"])
+                        for mn in _eff
+                        if _MODEL_TO_PKEY.get(mn) and edges.get(f"p_fair_{_MODEL_TO_PKEY[mn]}") is not None
+                    ]
+                    p_fair_now = float(np.mean(_exit_pfairs)) if len(_exit_pfairs) >= 2 else edges["p_fair_heston_ewma"]
+                else:
+                    p_key = _p_key_map.get(pos["model"], "gbm")
+                    p_fair_now = edges[f"p_fair_{p_key}"]
 
                 # Probability for the side we hold (YES → p_fair, NO → 1 - p_fair)
                 p_now   = p_fair_now        if side == "YES" else (1.0 - p_fair_now)
@@ -895,10 +947,18 @@ def _check_early_exit(
                     }
 
                 # 4. Edge has closed past hysteresis band.
+                # Computed directly from p_fair_now (works for all models including
+                # ensemble where p_key is not set).
                 # edge_neg_thresh = 0.0 → any negative edge triggers.
                 # edge_neg_thresh = 0.02 → edge must be ≤ −0.02 to trigger.
-                edge_key = f"edge_yes_{p_key}" if side == "YES" else f"edge_no_{p_key}"
-                current_edge = edges.get(edge_key)
+                _ask_now = ask_yes if side == "YES" else ask_no
+                if _ask_now is not None:
+                    current_edge = round(
+                        (p_fair_now - _ask_now) if side == "YES"
+                        else ((1.0 - p_fair_now) - _ask_now), 4
+                    )
+                else:
+                    current_edge = None
                 if current_edge is not None and current_edge <= -edge_neg_thresh:
                     return {
                         "exit_reason": f"edge_closed({current_edge:.3f})",
@@ -1025,7 +1085,8 @@ def _update_performance_ledger(sim_root: Path = SIM_ROOT) -> dict[str, dict]:
 
     _ALL_MODELS = ("gbm", "ewma", "garch", "student_t", "skewed_t", "heston",
                    "hybrid_t", "ou", "heston_ewma",
-                   "gbm_jump", "ewma_jump", "garch_jump", "student_t_jump", "hybrid_t_jump")
+                   "gbm_jump", "ewma_jump", "garch_jump", "student_t_jump", "hybrid_t_jump",
+                   "ensemble")
 
     for model in _ALL_MODELS:
         trades = [r for r in closed if r.get("model") == model]
@@ -1101,7 +1162,8 @@ def _update_real_ledger() -> None:
 
     _ALL_MODELS = ("gbm", "ewma", "garch", "student_t", "skewed_t", "heston",
                    "hybrid_t", "ou", "heston_ewma",
-                   "gbm_jump", "ewma_jump", "garch_jump", "student_t_jump", "hybrid_t_jump")
+                   "gbm_jump", "ewma_jump", "garch_jump", "student_t_jump", "hybrid_t_jump",
+                   "ensemble")
 
     for model in _ALL_MODELS:
         trades = [r for r in closed if r.get("model") == model]
@@ -1354,6 +1416,7 @@ def _print_summary(
         fmt("garch_jump",    "GARCH+J"),
         fmt("student_t_jump","StudT+J"),
         fmt("hybrid_t_jump", "HybT+J"),
+        fmt("ensemble",      "ENS"),
     ])
     pnl_str = f"  session_pnl=${session_pnl:+.2f}" if session_pnl != 0.0 else ""
     print(f"[{ts}]  {open_str}  session_closed={session_closed}{pnl_str}  {parts}")
@@ -1368,6 +1431,7 @@ def run(
     lookbacks:          dict[str, float] | None = None,
     min_edge:           float = 0.03,
     max_hours_to_settle:float = 1.5,
+    min_hours_to_settle:float = 0.0,   # skip contracts with less time than this (illiquid near-expiry)
     profit_lock:        float = 0.05,
     stop_loss:          float = 0.50,
     p_drop:             float = 0.05,
@@ -1379,6 +1443,18 @@ def run(
     trader=None,        # GeminiTrader | None  — None = simulation only
     active_models:      set | None = None,  # restrict entry to these models; None = all 14
     sim_root:           Path = SIM_ROOT,    # output directory for trades/ledger
+    # ── Confidence system ─────────────────────────────────────────────────
+    # Adjusts raw_edge → edge_adj = raw_edge × total_conf before comparing to
+    # min_edge.  total_conf = pred_conf^λ1 × data_conf^λ2 × ens_conf^λ3.
+    conf_pred_w:        float = 0.55,   # λ1 weight for model-disagreement component
+    conf_data_w:        float = 0.10,   # λ2 weight for OHLCV data-gap component
+    conf_ens_w:         float = 0.35,   # λ3 weight for directional-agreement component
+    conf_k:             float = 3.0,    # pred_conf harshness: conf = max(0, 1 - k×std)
+    conf_active:        list[str] | None = None,  # models for confidence; None = all 14
+    # ── Sim friction model (ignored when trader is set) ───────────────────
+    zero_fill_prob:     float = 0.15,   # prob of simulating an IOC zero-fill
+    entry_slip_max:     float = 0.02,   # max extra ¢ added to entry ask (uniform)
+    exit_slip_max:      float = 0.01,   # max ¢ subtracted from exit bid (uniform)
 ) -> None:
     """Poll contract data, calibrate all 14 models, simulate trades, manage exits."""
     _lb_defaults = {"gbm": 12.0, "ewma": 24.0, "garch": 48.0,
@@ -1393,14 +1469,22 @@ def run(
         lookbacks = {**_lb_defaults, **lookbacks}
 
     lb_str = "  ".join(f"{k}={v:.0f}h" for k, v in lookbacks.items())
+    _conf_active_str = ",".join(conf_active) if conf_active else "all"
     print(
         f"Starting live trading simulation\n"
         f"  poll={poll_sec}s  min_edge={min_edge:.1%}  max_horizon={max_hours_to_settle}h\n"
         f"  lookbacks: {lb_str}\n"
         f"  exit: profit_lock={profit_lock:.2f}  stop_loss={stop_loss:.0%}(rel)  "
         f"p_drop={p_drop:.2f}  edge_neg_thresh={edge_neg_thresh:.3f}\n"
-        f"  vol models: ewma_lambda={ewma_lambda}  rho_prior={rho}  vol_veto_mult={vol_veto_mult}x"
+        f"  vol models: ewma_lambda={ewma_lambda}  rho_prior={rho}  vol_veto_mult={vol_veto_mult}x\n"
+        f"  confidence: λ=(pred={conf_pred_w},data={conf_data_w},ens={conf_ens_w})  "
+        f"k={conf_k}  active=[{_conf_active_str}]\n"
+        f"  sim friction: zero_fill_prob={zero_fill_prob:.0%}  "
+        f"entry_slip=[0,{entry_slip_max:.2f}]  exit_slip=[0,{exit_slip_max:.2f}]"
+        + ("  [DISABLED — live trader]" if trader is not None else "")
     )
+    # Random number generator for sim friction (unseeded = different each run).
+    _rng = np.random.default_rng()
     sim_root.mkdir(parents=True, exist_ok=True)
     print(f"Output → {sim_root.resolve()}")
 
@@ -1409,11 +1493,15 @@ def run(
     _ensure_header(trade_out, TRADE_FIELDS)
     _ensure_header(edge_out,  EDGE_FIELDS)
 
-    # Real-money trade log — only created when a live trader is injected.
+    # Real-money trade log — only created when a live trader is injected AND
+    # sim_root differs from REAL_ROOT.  When they are the same path, trade_out
+    # IS the real trade log so writing again would produce duplicate rows.
     real_trade_out: Path | None = None
     if trader is not None:
-        real_trade_out = _real_trade_out_path()
-        _ensure_header(real_trade_out, TRADE_FIELDS)
+        _rt = _real_trade_out_path()
+        if _rt.resolve() != trade_out.resolve():
+            real_trade_out = _rt
+            _ensure_header(real_trade_out, TRADE_FIELDS)
         print(f"Real trades → {REAL_ROOT.resolve()}")
 
     # Load cumulative ledger at startup so scores show historical data immediately.
@@ -1454,6 +1542,7 @@ def run(
     seen_garch_jump:   set[str] = set()
     seen_stud_jump:    set[str] = set()
     seen_hybrid_jump:  set[str] = set()
+    seen_ensemble:     set[str] = set()   # confidence-weighted mean of conf_active models
     # Contracts that have had their edge signal logged (once per contract per session).
     # Independent of model selection so edge log is written regardless of active_models.
     edge_seen: set[str] = set()
@@ -1474,6 +1563,7 @@ def run(
         "garch_jump":    seen_garch_jump,
         "student_t_jump":seen_stud_jump,
         "hybrid_t_jump": seen_hybrid_jump,
+        "ensemble":      seen_ensemble,
     }
     # Entry delay: (sim only) holds pending entries for one poll before executing.
     # Key: model_name. Value: dict[contract_id → entry metadata].
@@ -1595,6 +1685,7 @@ def run(
                 edge_neg_thresh  = edge_neg_thresh,
                 vol_veto_mult    = vol_veto_mult,
                 precomputed_edges = _exit_edges_cache[edges_key],
+                conf_active      = conf_active,
             )
 
             if exit_info:
@@ -1659,15 +1750,47 @@ def run(
                                 or "position found" in exc_str  # catch any future wording
                             )
                             if _no_position:
-                                # Exchange says we don't hold these contracts — they were
-                                # already settled or sold externally.  Force-close at $0
-                                # so we don't loop forever trying to sell phantom contracts.
-                                print(
-                                    f"    [SELL]  Position gone on exchange — "
-                                    f"force-closing at $0 ({exc_str[:80]})"
-                                )
-                                exit_info["exit_bid"] = 0.0
-                                exit_info["exit_pnl"] = round(0.0 - float(pos["ask_price"]), 4)
+                                # Exchange says we don't hold these contracts — already
+                                # settled or sold externally.  Try to infer settlement
+                                # value from spot vs strike if the contract has expired;
+                                # otherwise fall back to $0 (external sale, unknown price).
+                                _spot_now  = live_spots.get(pos.get("asset", ""))
+                                _strike    = _safe_float(pos.get("strike"))
+                                _settle_str = pos.get("settle_time_utc", "")
+                                _expired   = False
+                                try:
+                                    _settle_dt = datetime.fromisoformat(
+                                        _settle_str.replace("Z", "+00:00")
+                                    )
+                                    _expired = now_utc >= _settle_dt
+                                except Exception:
+                                    pass
+                                if _expired and _spot_now and _strike:
+                                    _direction = pos.get("direction", "HI")
+                                    _side_p    = pos.get("side", "NO")
+                                    _yes_wins  = (
+                                        (_direction == "HI" and _spot_now > _strike)
+                                        or (_direction == "LO" and _spot_now <= _strike)
+                                    )
+                                    _we_win = (
+                                        (_side_p == "YES" and _yes_wins)
+                                        or (_side_p == "NO" and not _yes_wins)
+                                    )
+                                    _sv = 1.0 if _we_win else 0.0
+                                    print(
+                                        f"    [SELL]  Position gone — settled at ${_sv:.2f} "
+                                        f"(spot={_spot_now:.0f} vs strike={_strike:.0f}, "
+                                        f"dir={_direction}, side={_side_p}) "
+                                        f"({exc_str[:60]})"
+                                    )
+                                else:
+                                    _sv = 0.0
+                                    print(
+                                        f"    [SELL]  Position gone on exchange — "
+                                        f"force-closing at $0 ({exc_str[:80]})"
+                                    )
+                                exit_info["exit_bid"] = _sv
+                                exit_info["exit_pnl"] = round(_sv - float(pos["ask_price"]), 4)
                                 pos["n_contracts_filled"] = 0  # nothing left to sell
                                 # fall through to _apply_early_exit below
                             else:
@@ -1678,6 +1801,14 @@ def run(
                                 )
                                 still_open.append(pos)
                                 continue
+                # ── Sim exit slippage ──────────────────────────────────────
+                # Models bid deterioration when we hit the bid to exit early.
+                # Not applied in live trading (trader is not None handles real fills).
+                if trader is None and exit_slip_max > 0:
+                    _slip = float(_rng.uniform(0, exit_slip_max))
+                    _slipped_bid = max(0.0, round(exit_info["exit_bid"] - _slip, 4))
+                    exit_info["exit_bid"] = _slipped_bid
+                    exit_info["exit_pnl"] = round(_slipped_bid - float(pos["ask_price"]), 4)
                 _apply_early_exit(pos, exit_info, now_utc)
                 closed_positions.append(pos)
                 _append_csv(trade_out, pos, TRADE_FIELDS)
@@ -1685,8 +1816,10 @@ def run(
                     _append_csv(real_trade_out, pos, TRADE_FIELDS)
                     _update_real_ledger()
                 _log_exit(pos, exit_info)
-                n = pos.get("n_contracts_filled") or 0
-                session_pnl += exit_info["exit_pnl"] * n
+                # Use blended per-unit pnl × original contracts for session display.
+                # n_contracts_filled may be 0 after force-close, so use n_original.
+                _n_orig = pos.get("n_contracts_original") or pos.get("n_contracts_filled") or 0
+                session_pnl += float(pos.get("pnl") or 0.0) * _n_orig
                 ledger_stats = _update_performance_ledger(sim_root)
                 exit_reason = exit_info.get("exit_reason", "")
                 if exit_reason in ("stop_loss", "p_drop"):
@@ -1747,6 +1880,22 @@ def run(
                         # Edge gone at execution — cancel, allow re-detection
                         _pending.pop(_cid, None)
                         continue
+                    # ── Sim friction: IOC zero-fill + entry slippage ─────────
+                    # zero_fill_prob: models orders that return unfilled because
+                    # the market moved between signal detection and submission.
+                    # Re-adds to pending on next poll so re-detection can occur.
+                    if _rng.random() < zero_fill_prob:
+                        _pending.pop(_cid, None)
+                        continue  # silently cancelled — allow re-evaluation
+                    # entry_slip: models stale CSV ask + IOC execution friction.
+                    # Adds a random [0, entry_slip_max] cost to the execution price.
+                    if entry_slip_max > 0:
+                        _slip = float(_rng.uniform(0, entry_slip_max))
+                        _cur_ask = min(round(_cur_ask + _slip, 4), 0.99)
+                        _cur_edge = round(_p_sid - _cur_ask, 4)
+                        if _cur_edge <= min_edge:
+                            _pending.pop(_cid, None)
+                            continue  # slippage killed the edge — cancel
                     # Enter at current (next-poll) ask price — realistic entry
                     _pos = _create_position(
                         _pdata["row"], _model_name, _side, _cur_ask,
@@ -1791,9 +1940,10 @@ def run(
             except (KeyError, ValueError):
                 continue
 
-            # Skip contracts that have already settled or are too far out.
+            # Skip contracts that have already settled, are too far out, or too close
+            # to settlement (near-expiry contracts are illiquid — no sellers).
             current_hrs = (settle_time_utc - now_utc).total_seconds() / 3600.0
-            if current_hrs < 0 or current_hrs > max_hours_to_settle:
+            if current_hrs < min_hours_to_settle or current_hrs > max_hours_to_settle:
                 continue
 
             # need_X is False for inactive models so they don't prevent the outer
@@ -1813,11 +1963,13 @@ def run(
             need_garch_jump  = (contract_id not in seen_garch_jump)  and (_am is None or "garch_jump"     in _am)
             need_stud_jump   = (contract_id not in seen_stud_jump)   and (_am is None or "student_t_jump" in _am)
             need_hybrid_jump = (contract_id not in seen_hybrid_jump) and (_am is None or "hybrid_t_jump"  in _am)
+            # Ensemble always runs when conf_active models have data (not gated by active_models)
+            need_ensemble    = contract_id not in seen_ensemble
             need_edge        = contract_id not in edge_seen  # edge log independent of model filter
             if not (need_gbm or need_ewma or need_garch or need_stud or need_skt or need_heston
                     or need_hybrid or need_ou or need_heston_ewma
                     or need_gbm_jump or need_ewma_jump or need_garch_jump
-                    or need_stud_jump or need_hybrid_jump or need_edge):
+                    or need_stud_jump or need_hybrid_jump or need_ensemble or need_edge):
                 continue
 
             edges = _compute_edges(
@@ -1835,6 +1987,55 @@ def run(
                 rho             = rho,
                 vol_veto_mult   = vol_veto_mult,
             )
+
+            # ── Ensemble confidence: gather p_fairs from conf_active models ──────
+            # Done once per contract; shared by all model iterations below.
+            # _active_pfairs_yes: p_fair(YES) from each active conf model
+            # _n_agree_yes/no:    how many active models favour each side
+            _active_pfairs_yes: list[float] = []
+            _n_agree_yes = 0
+            _n_agree_no  = 0
+            if edges is not None:
+                _eff_conf_models = conf_active if conf_active else list(_MODEL_TO_PKEY.keys())
+                for _cmn in _eff_conf_models:
+                    _cpk = _MODEL_TO_PKEY.get(_cmn)
+                    if _cpk is None:
+                        continue
+                    _pf = edges.get(f"p_fair_{_cpk}")
+                    if _pf is None:
+                        continue
+                    _active_pfairs_yes.append(float(_pf))
+                    _ey = edges.get(f"edge_yes_{_cpk}")
+                    _en = edges.get(f"edge_no_{_cpk}")
+                    if _ey is not None and _en is not None:
+                        if _ey >= _en:
+                            _n_agree_yes += 1
+                        else:
+                            _n_agree_no += 1
+                    elif _ey is not None and _ey > 0:
+                        _n_agree_yes += 1
+                    elif _en is not None and _en > 0:
+                        _n_agree_no += 1
+            _n_conf_active = len(_active_pfairs_yes)
+            # NO-side p_fairs are 1 − YES-side p_fairs (same distribution, flipped)
+            _active_pfairs_no = [1.0 - p for p in _active_pfairs_yes]
+
+            # ── Patch ensemble p_fair into edges so the model loop can treat
+            # "ensemble" like any other model (p_key = "ensemble").
+            # p_fair_ensemble = mean of conf_active model p_fairs.
+            # data_conf_ensemble = mean of their data_conf values.
+            if edges is not None and _n_conf_active >= 2:
+                _pf_ens = float(np.mean(_active_pfairs_yes))
+                _eff_conf = conf_active if conf_active else list(_MODEL_TO_PKEY.keys())
+                _dc_vals = [
+                    float(edges.get(f"data_conf_{_MODEL_TO_PKEY[mn]}", 1.0))
+                    for mn in _eff_conf
+                    if _MODEL_TO_PKEY.get(mn) and edges.get(f"p_fair_{_MODEL_TO_PKEY[mn]}") is not None
+                ]
+                edges["p_fair_ensemble"]    = round(_pf_ens, 4)
+                edges["edge_yes_ensemble"]  = round(_pf_ens - ask_yes, 4) if ask_yes is not None else None
+                edges["edge_no_ensemble"]   = round((1.0 - _pf_ens) - ask_no, 4) if ask_no is not None else None
+                edges["data_conf_ensemble"] = float(np.mean(_dc_vals)) if _dc_vals else 1.0
 
             if need_edge:  # log edge signals once per contract (all models in one row)
                 edge_seen.add(contract_id)
@@ -1942,13 +2143,19 @@ def run(
                 ("garch_jump",    "garch_jump", seen_garch_jump,  need_garch_jump),
                 ("student_t_jump","stud_jump",  seen_stud_jump,   need_stud_jump),
                 ("hybrid_t_jump", "hybrid_jump",seen_hybrid_jump, need_hybrid_jump),
+                # Ensemble: mean p_fair of conf_active models, confidence-adjusted.
+                # p_fair_ensemble / edge_*_ensemble patched into edges dict above.
+                ("ensemble",      "ensemble",   seen_ensemble,    need_ensemble),
             ]:
                 if not needed:
                     continue  # already evaluated for this model
-                if active_models is not None and model_name not in active_models:
-                    continue  # model not selected for this run
+                if model_name != "ensemble" and active_models is not None and model_name not in active_models:
+                    continue  # model not selected for this run (ensemble always allowed)
                 if edges is None:
                     continue  # OHLCV stale or insufficient — retry next poll
+                # Ensemble requires at least 2 conf_active models with data
+                if model_name == "ensemble" and _n_conf_active < 2:
+                    continue
 
                 # NOTE: seen_set.add() is intentionally deferred until after a
                 # confirmed entry below.  Adding here would permanently blacklist
@@ -2002,6 +2209,28 @@ def run(
                     # Simulation mode (trader is None): fall through using CSV ask.
                     continue
 
+                # ── Confidence-adjusted edge (ensemble model only) ─────────────
+                # Individual models use their raw edges unchanged.
+                # Only the "ensemble" model applies total_conf scaling:
+                #   total_conf = pred_conf^λ1 × data_conf^λ2 × ens_conf^λ3
+                # edge_val for ensemble already equals mean_p_fair − ask (raw);
+                # multiplying by total_conf shrinks it toward 0 based on
+                # model agreement and data quality.
+                if model_name == "ensemble" and _n_conf_active >= 2:
+                    _pfairs = _active_pfairs_yes if side == "YES" else _active_pfairs_no
+                    _pred_conf = max(0.0, 1.0 - conf_k * float(np.std(_pfairs)))
+                    _data_conf = float(edges.get("data_conf_ensemble", 1.0))
+                    _n_agree   = _n_agree_yes if side == "YES" else _n_agree_no
+                    _ens_conf  = 0.5 + 0.5 * (_n_agree / _n_conf_active)
+                    _total_conf = (
+                        (_pred_conf ** conf_pred_w if conf_pred_w > 0 else 1.0)
+                        * (_data_conf ** conf_data_w if conf_data_w > 0 else 1.0)
+                        * (_ens_conf  ** conf_ens_w  if conf_ens_w  > 0 else 1.0)
+                    )
+                    edge_val = round(edge_val * _total_conf, 4)
+                    if edge_val <= min_edge:
+                        continue  # confidence too low — allow re-evaluation
+
                 # Market mid for the side we're trading
                 mid_yes = _safe_float(row.get("mid_yes"))
                 market_mid = mid_yes if side == "YES" else \
@@ -2033,7 +2262,7 @@ def run(
                         # Submit 3 cents above quoted ask to absorb staleness.
                         # IOC fills at actual market price (≤ limit), not the
                         # inflated limit, so edge calculation remains valid.
-                        buffered_limit = min(round(ask_price + 0.03, 4), 0.99)
+                        buffered_limit = min(round(ask_price + 0.04, 4), 0.99)
                         order = trader.place_order(
                             contract_id = contract_id,
                             side        = side,
@@ -2093,9 +2322,12 @@ def run(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    _s  = cfg.section("simulation")
-    _ex = cfg.section("simulation.exit")
-    _lb = cfg.section("simulation.lookback")
+    _s   = cfg.section("simulation")
+    _ex  = cfg.section("simulation.exit")
+    _lb  = cfg.section("simulation.lookback")
+    _cf  = cfg.section("simulation.confidence")
+    # active_models for confidence: list from TOML or None (all models)
+    _cf_active_default: list[str] | None = _cf.get("active_models", None)
 
     # Per-model lookback defaults from config
     _lb_defaults = {
@@ -2125,6 +2357,8 @@ if __name__ == "__main__":
                         help="Min model edge required to enter a trade")
     parser.add_argument("--max-hours-to-settle", type=float, default=_s.get("max_hours_to_settle", 1.5),
                         help="Skip contracts settling more than this many hours away")
+    parser.add_argument("--min-hours-to-settle", type=float, default=_s.get("min_hours_to_settle", 0.0),
+                        help="Skip contracts settling less than this many hours away (avoids near-expiry illiquidity)")
     parser.add_argument("--profit-lock",         type=float, default=_ex.get("profit_lock",        0.05),
                         help="Early exit when bid_now - ask_entry >= this (skipped within 30 min of settlement)")
     parser.add_argument("--stop-loss",           type=float, default=_ex.get("stop_loss",          0.50),
@@ -2174,6 +2408,27 @@ if __name__ == "__main__":
                         help="Output directory for trades/ledger CSV files "
                              "(default: .data/gemini/sim_trades). Use a different "
                              "path to run a parallel experiment without mixing results.")
+    # Confidence system
+    parser.add_argument("--conf-pred-w",  type=float, default=_cf.get("pred_conf_weight",     0.55),
+                        help="λ1 weight for pred_conf (model disagreement) in geometric mean")
+    parser.add_argument("--conf-data-w",  type=float, default=_cf.get("data_conf_weight",     0.10),
+                        help="λ2 weight for data_conf (OHLCV gap ratio) in geometric mean")
+    parser.add_argument("--conf-ens-w",   type=float, default=_cf.get("ensemble_conf_weight", 0.35),
+                        help="λ3 weight for ensemble_conf (directional agreement) in geometric mean")
+    parser.add_argument("--conf-k",       type=float, default=_cf.get("pred_conf_k",          3.0),
+                        help="Harshness of pred_conf: conf = max(0, 1 - k × std(p_fairs))")
+    parser.add_argument("--conf-active",  type=str,   default=None,
+                        help="Comma-separated model names for confidence computation "
+                             "(default: from config.toml active_models). "
+                             "Example: heston_ewma,garch,student_t")
+    # Sim friction (slippage / IOC zero-fill)
+    _sl = cfg.section("simulation.slippage")
+    parser.add_argument("--zero-fill-prob",  type=float, default=_sl.get("zero_fill_prob", 0.15),
+                        help="Sim-only: probability of simulating an IOC zero-fill at entry")
+    parser.add_argument("--entry-slip-max",  type=float, default=_sl.get("entry_slip_max", 0.02),
+                        help="Sim-only: max extra ¢ added to entry ask (uniform [0, max])")
+    parser.add_argument("--exit-slip-max",   type=float, default=_sl.get("exit_slip_max",  0.01),
+                        help="Sim-only: max ¢ subtracted from exit bid at early exit (uniform [0, max])")
     args = parser.parse_args()
 
     run(
@@ -2196,6 +2451,7 @@ if __name__ == "__main__":
         },
         min_edge            = args.min_edge,
         max_hours_to_settle = args.max_hours_to_settle,
+        min_hours_to_settle = args.min_hours_to_settle,
         profit_lock         = args.profit_lock,
         stop_loss           = args.stop_loss,
         p_drop              = args.p_drop,
@@ -2205,4 +2461,13 @@ if __name__ == "__main__":
         vol_veto_mult       = args.vol_veto_mult,
         no_collectors       = args.no_collectors,
         sim_root            = Path(args.trades_dir) if args.trades_dir else SIM_ROOT,
+        conf_pred_w         = args.conf_pred_w,
+        conf_data_w         = args.conf_data_w,
+        conf_ens_w          = args.conf_ens_w,
+        conf_k              = args.conf_k,
+        conf_active         = [m.strip() for m in args.conf_active.split(",") if m.strip()]
+                              if args.conf_active else _cf_active_default,
+        zero_fill_prob      = args.zero_fill_prob,
+        entry_slip_max      = args.entry_slip_max,
+        exit_slip_max       = args.exit_slip_max,
     )

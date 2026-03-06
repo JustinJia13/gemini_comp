@@ -1,12 +1,12 @@
 # Live Trading Simulation — Usage Guide
 
-The pipeline has three scripts that work together.  In normal operation you
-only need to start one of them — the simulation auto-launches the other two.
+The pipeline has three scripts that work together. In normal operation you only
+need to start one — the simulation auto-launches the other two.
 
 ```
 live_trading_sim.py              ← start this
   └─ getdata_underlying.py       ← auto-started (1-min OHLCV updater)
-  └─ getdata_prediction_contract.py  ← auto-started (Gemini prediction contract prices)
+  └─ getdata_prediction_contract.py  ← auto-started (contract prices)
 ```
 
 ---
@@ -17,142 +17,181 @@ live_trading_sim.py              ← start this
 python live_trading_sim.py
 ```
 
-That's it.  Both data-collector subprocesses start automatically, print their
-PIDs, and are terminated cleanly when the sim exits (Ctrl-C or otherwise).
+Both data-collector subprocesses start automatically, print their PIDs, and are
+terminated cleanly when the sim exits (Ctrl-C or otherwise).
 
 ---
 
 ## All CLI flags
 
-```
-python live_trading_sim.py [OPTIONS]
-```
+### Core simulation
 
 | Flag | Default | Description |
 |---|---|---|
 | `--poll-sec` | 60 | Seconds between update cycles |
-| `--min-edge` | 0.03 | Minimum model edge to enter a trade (e.g. 0.03 = 3¢) |
-| `--max-hours-to-settle` | 1.5 | Skip contracts settling more than this far away |
-| `--profit-lock` | 0.05 | Early exit when `bid_now − ask_entry ≥ this` |
-| `--stop-loss` | 0.10 | Early exit when `ask_entry − bid_now ≥ this` |
-| `--p-drop` | 0.05 | Early exit when model p(side) drops by this from entry |
+| `--min-edge` | 0.07 | Minimum confidence-adjusted edge to enter (e.g. 0.07 = 7¢) |
+| `--max-hours-to-settle` | 1.5 | Skip contracts settling more than this many hours away |
+| `--min-hours-to-settle` | 0.0 | Skip contracts with fewer than this many hours to settle (0 = off; avoids near-expiry illiquidity) |
 | `--ewma-lambda` | 0.94 | EWMA decay factor λ (RiskMetrics default) |
 | `--rho` | −0.5 | Prior price-vol correlation for skewed-t / Heston |
-| `--lb-gbm` | 24.0 | GBM calibration lookback (hours) |
-| `--lb-ewma` | 48.0 | EWMA calibration lookback (hours) |
-| `--lb-garch` | 72.0 | GARCH calibration lookback (hours) |
-| `--lb-stud` | 48.0 | Student-t calibration lookback (hours) |
-| `--lb-skt` | 48.0 | Skewed-t calibration lookback (hours) |
-| `--lb-heston` | 96.0 | Heston calibration lookback (hours) |
+| `--vol-veto-mult` | 2.0 | Block all entries when 10-min realised vol > this × EWMA vol (0 = off) |
 | `--no-collectors` | off | Skip auto-starting the two data-collector scripts |
+| `--trades-dir` | `.data/gemini/sim_trades` | Output directory for trades/ledger CSV files |
 
-All defaults are read from [`config.toml`](../config.toml) — edit that file to
-change the persistent defaults without touching the command line.
+### Exit conditions
+
+| Flag | Default | Description |
+|---|---|---|
+| `--profit-lock` | 0.10 | Exit when `bid_now − ask_entry ≥ this` (10¢ absolute gain). Skipped within 30 min of settlement. |
+| `--stop-loss` | 0.50 | Exit when `(ask_entry − bid_now) / ask_entry ≥ this` (50% relative drawdown). 19¢ entry stops at 9.5¢. |
+| `--p-drop` | 0.10 | Exit when model p(side) drops ≥ this from entry p_fair |
+| `--edge-neg-thresh` | 0.02 | `edge_closed` fires only when edge ≤ −this (hysteresis; 0 = any negative edge) |
+
+### Per-model lookback windows (hours)
+
+| Flag | Default | Model |
+|---|---|---|
+| `--lb-gbm` | 12 | GBM rolling σ |
+| `--lb-ewma` | 24 | EWMA vol |
+| `--lb-garch` | 48 | GARCH(1,1) |
+| `--lb-stud` | 24 | Student-t |
+| `--lb-skt` | 24 | Skewed-t |
+| `--lb-heston` | 72 | Heston SV |
+| `--lb-hybrid` | 24 | Hybrid-t |
+| `--lb-ou` | 12 | Ornstein-Uhlenbeck |
+| `--lb-heston-ewma` | 72 | Heston-EWMA |
+| `--lb-gbm-jump` | 24 | GBM + Jump |
+| `--lb-ewma-jump` | 36 | EWMA + Jump |
+| `--lb-garch-jump` | 48 | GARCH + Jump |
+| `--lb-stud-jump` | 36 | Student-t + Jump |
+| `--lb-hybrid-jump` | 36 | Hybrid-t + Jump |
+
+### Confidence system
+
+| Flag | Default | Description |
+|---|---|---|
+| `--conf-pred-w` | 0.55 | λ₁: weight for model-disagreement component |
+| `--conf-data-w` | 0.10 | λ₂: weight for OHLCV data-gap component |
+| `--conf-ens-w` | 0.35 | λ₃: weight for directional-agreement component |
+| `--conf-k` | 3.0 | Harshness: `pred_conf = max(0, 1 − k × std(p_fairs))` |
+| `--conf-active` | (from config) | Comma-separated model names for confidence computation. Example: `heston_ewma,garch,student_t` |
+
+### Simulation friction (sim-only, ignored in live trading)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--zero-fill-prob` | 0.15 | Probability a pending sim entry is cancelled (models IOC zero-fill) |
+| `--entry-slip-max` | 0.02 | Max extra ¢ added to entry ask, drawn from U[0, max] |
+| `--exit-slip-max` | 0.01 | Max ¢ subtracted from exit bid at early exit, drawn from U[0, max] |
+
+All defaults are read from [`config.toml`](../config.toml). Edit that file to
+change persistent defaults without touching the command line.
 
 ---
 
 ## Common invocations
 
 ```bash
-# Default run (recommended — collectors start automatically)
+# Default run
 python live_trading_sim.py
 
-# Raise the edge bar and tighten exits
-python live_trading_sim.py --min-edge 0.05 --profit-lock 0.04 --stop-loss 0.08
+# Run a confidence-system experiment in a separate output directory
+python live_trading_sim.py --trades-dir .data/gemini/sim_trades_v2
 
-# Use a shorter GBM window (more reactive) and longer Heston window
-python live_trading_sim.py --lb-gbm 12 --lb-heston 120
+# Raise edge threshold and tighten exits
+python live_trading_sim.py --min-edge 0.09 --profit-lock 0.08 --stop-loss 0.40
 
-# Poll every 30 s instead of 60 s
-python live_trading_sim.py --poll-sec 30
+# Adjust confidence harshness (less harsh = more trades)
+python live_trading_sim.py --conf-k 2.0
 
-# Run collectors manually in separate terminals, skip auto-start
+# Override confidence active models
+python live_trading_sim.py --conf-active heston_ewma,garch,garch_jump
+
+# Disable slippage friction to replicate old sim behaviour
+python live_trading_sim.py --zero-fill-prob 0 --entry-slip-max 0 --exit-slip-max 0
+
+# Use shorter GARCH and Heston windows for faster regime tracking
+python live_trading_sim.py --lb-garch 24 --lb-heston 48 --lb-heston-ewma 48
+
+# Manage collectors manually in separate terminals
 python live_trading_sim.py --no-collectors
-# (in another terminal) python getdata_underlying.py
-# (in another terminal) python getdata_prediction_contract.py
+python getdata_underlying.py        # in another terminal
+python getdata_prediction_contract.py  # in another terminal
 ```
 
 ---
 
 ## Configuration file
 
-All defaults live in [`config.toml`](../config.toml).  The relevant sections:
+All defaults live in [`config.toml`](../config.toml). Key sections:
 
 ```toml
 [simulation]
-poll_sec            = 60
-min_edge            = 0.03
-max_hours_to_settle = 1.5
-ewma_lambda         = 0.94
-rho                 = -0.5
+poll_sec             = 60
+min_edge             = 0.07
+max_hours_to_settle  = 1.5
+ewma_lambda          = 0.94
+rho                  = -0.5
+vol_veto_mult        = 2.0
 
 [simulation.exit]
-profit_lock = 0.05
-stop_loss   = 0.10
-p_drop      = 0.05
+profit_lock      = 0.10   # 10¢ absolute gain
+stop_loss        = 0.50   # 50% relative drawdown from entry price
+p_drop           = 0.10   # 10pp model probability drop
+edge_neg_thresh  = 0.02   # hysteresis band for edge_closed
 
 [simulation.lookback]
-# Per-model calibration windows (hours)
-gbm    = 24.0   # short — tracks intraday regime shifts
-ewma   = 48.0   # EWMA down-weights old data anyway
-garch  = 72.0   # MLE needs more bars for tight α, β
-stud   = 48.0   # Student-t tail estimation
-skt    = 48.0   # Skewed-t (same as student_t)
-heston = 96.0   # AR(1) on hourly realised vars needs many windows
+gbm           = 12.0
+ewma          = 24.0
+garch         = 48.0
+stud          = 24.0
+skt           = 24.0
+heston        = 72.0
+hybrid        = 24.0
+ou            = 12.0
+heston_ewma   = 72.0
+gbm_jump      = 24.0
+ewma_jump     = 36.0
+garch_jump    = 48.0
+student_t_jump= 36.0
+hybrid_t_jump = 36.0
+
+[simulation.confidence]
+pred_conf_weight     = 0.55
+data_conf_weight     = 0.10
+ensemble_conf_weight = 0.35
+pred_conf_k          = 3.0
+active_models        = ["heston_ewma", "garch", "student_t", "skewed_t", "garch_jump", "gbm_jump"]
+
+[simulation.slippage]
+zero_fill_prob = 0.15
+entry_slip_max = 0.02
+exit_slip_max  = 0.01
 ```
-
----
-
-## Volatility models
-
-Each contract is evaluated by six models independently.  A trade fires only
-when one model's edge exceeds `--min-edge`.
-
-| # | Model | Key params | Notes |
-|---|---|---|---|
-| 1 | **GBM** | rolling σ | Closed-form Black-Scholes binary price |
-| 2 | **EWMA** | λ, σ_EWMA | Exponentially-weighted σ, same closed form |
-| 3 | **GARCH(1,1)** | α, β, ω | MLE-fit; uses longer lookback for stability |
-| 4 | **Student-t** | ν, scale | Fat-tail MC (20 k paths) |
-| 5 | **Skewed-t** | ν, γ, rho | Fernández-Steel; γ from elastic-net regression |
-| 6 | **Heston SV** | κ, θ, ξ, ρ, v₀ | Full-truncation Euler MC; κ/ξ from AR(1) on hourly realised variance |
-
-Per-model lookback windows are independent — GARCH and Heston use longer
-histories while GBM stays reactive to intraday moves.  Windows with the same
-length share a single pre-computed return array (no redundant reads).
 
 ---
 
 ## Entry and exit execution
 
-The contract CSV (written by `getdata_prediction_contract.py`) has up to 60s
-lag.  To avoid entering at a stale price or exiting at a stale bid, the sim
-makes a direct Gemini API call at the moment of execution:
-
-- **Entry:** after the CSV edge check passes, a live quote is fetched.  If the
-  ask has moved and the edge is gone, the trade is skipped.  Otherwise the
-  fresh ask is used as the recorded entry price.
-
-- **Early exit:** after a profit-lock / stop-loss / p-drop / edge-closed
-  signal fires, a live bid is fetched and used as `exit_bid` so the recorded
-  P&L is accurate.
-
-Settlement uses OHLCV data (not market prices), so no live quote is needed
-there.  The settlement price is the close of the last 1-minute bar whose open
-is strictly before the settle timestamp — the correct look-ahead-free reference.
+**Entry sequence:**
+1. CSV edge check: `edge_yes` or `edge_no` for a model exceeds `min_edge`.
+2. Confidence computation: `edge_adj = raw_edge × total_conf`. Skip if `edge_adj ≤ min_edge`.
+3. Contract queued in `pending_by_model` (1-poll delay before executing).
+4. Next poll: live ask re-fetched from Gemini API. If fresh edge gone, cancelled.
+5. Sim friction applied: zero-fill check, then entry slippage. If slippage kills edge, cancelled.
+6. Position opened at friction-adjusted ask.
 
 **Exit conditions (first one to fire wins):**
 
-| Condition | Trigger |
-|---|---|
-| `profit_lock` | `bid_now − ask_entry ≥ profit_lock` (default 5¢) |
-| `stop_loss` | `ask_entry − bid_now ≥ stop_loss` (default 10¢) |
-| `p_drop` | model p(side) fell by ≥ `p_drop` from entry (default 5 pp) |
-| `edge_closed` | current edge for our side turned negative |
-| settlement | contract expired; spot looked up from OHLCV |
+| Condition | Trigger | Notes |
+|---|---|---|
+| `profit_lock` | `bid_now − ask_entry ≥ 0.10` | Skipped within 30 min of settlement |
+| `stop_loss` | `(ask_entry − bid_now) / ask_entry ≥ 0.50` | Relative; 19¢ entry stops at 9.5¢ |
+| `p_drop` | Model p(side) fell ≥ 0.10 from entry | Information-based exit |
+| `edge_closed` | Edge ≤ −0.02 | Hysteresis prevents noise-triggered exits |
+| `settlement` | Contract expired | Spot from OHLCV |
 
-After any exit, the contract becomes eligible for re-entry on the next poll
-if a new edge appears (no session-long blacklist).
+After `stop_loss` or `p_drop` exit, same `contract × model` requires **2× min_edge** to re-enter.
 
 ---
 
@@ -160,30 +199,81 @@ if a new edge appears (no session-long blacklist).
 
 ```
 .data/gemini/sim_trades/
-  trades_{YYYYMMDD}.csv          — one row per closed position
-  edge_log_{YYYYMMDD}.csv        — all model edges at first contract sighting
-  performance_ledger.csv         — cumulative P&L / accuracy per model
-                                   (aggregated from all historical trade files,
-                                    updated after every close)
+  trades_{YYYYMMDD}.csv       — one row per closed position (21 fields)
+  edge_log_{YYYYMMDD}.csv     — all 14 model edges at first contract sighting
+  performance_ledger.csv      — cumulative P&L / accuracy per model
+                                (aggregated from all historical files,
+                                 updated after every close)
+```
+
+**Trade CSV fields (21):**
+`entry_time_utc, contract_id, event_ticker, asset, strike, direction,
+settle_time_utc, hours_to_settle_at_entry, side, model, p_fair, ask_price,
+edge, exit_time_utc, exit_reason, exit_bid, spot_at_settle, outcome, pnl,
+status, gemini_order_id`
+
+Use `--trades-dir` for parallel experiments:
+```bash
+python live_trading_sim.py                                    # default dir
+python live_trading_sim.py --trades-dir .data/gemini/sim_v2  # separate dir
 ```
 
 ---
 
 ## Running the data collectors standalone
 
-If you prefer to manage the collectors yourself (e.g. on a different machine or
-in a tmux pane), launch them independently and pass `--no-collectors` to the sim.
-
 ```bash
 # 1-minute OHLCV for BTC / ETH / SOL
-python getdata_underlying.py                    # default 60 s poll
+python getdata_underlying.py
 python getdata_underlying.py --poll-sec 30
 python getdata_underlying.py --symbols btcusd ethusd
 
 # Gemini prediction contract prices
-python getdata_prediction_contract.py           # default 60 s poll
+python getdata_prediction_contract.py
 python getdata_prediction_contract.py --poll-sec 30
 ```
 
-The underlying updater writes to `.data/gemini/ohlcv_1m_7d/{symbol}_est.data`,
-which is the file the simulation reads on every poll.
+Underlying data writes to `.data/gemini/ohlcv_1m_7d/{symbol}_est.data`.
+Contract data writes to `.data/gemini/prediction_data/{YYYYMMDD}.csv`.
+
+---
+
+## Live trading (`live_trader.py`)
+
+`live_trader.py` wraps `live_trading_sim.run()` with a real Gemini order layer.
+It accepts all the same flags as the simulation plus these additional ones:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--api-key` | `$GEMINI_API_KEY` | Gemini API key |
+| `--api-secret` | `$GEMINI_API_SECRET` | Gemini API secret |
+| `--sandbox` | off | Paper trading — no real money |
+| `--bet-dollars` | 20.0 | Target notional per trade (USD) |
+| `--model` | (none) | Individual models to trade alongside the ensemble. Default: ensemble only. Example: `--model skewed_t heston_ewma` |
+| `--trades-dir` | `.data/gemini/real_trades` | Output directory for real trade files |
+
+**Default behaviour: ensemble only.** No individual model places orders unless
+explicitly named with `--model`. The ensemble is always active regardless.
+
+Real trades are written to `.data/gemini/real_trades/` (separate from the sim
+directory to prevent cross-contamination):
+
+```
+.data/gemini/real_trades/
+  trades_{YYYYMMDD}.csv       — real trade log (same 21-field schema as sim)
+  performance_ledger.csv      — same as sim ledger + real-dollar columns
+                                (total_real_dollars, avg_real_dollars_per_trade)
+```
+
+**"Position gone" settlement inference.** When the exchange returns
+`InsufficientPosition` on a sell, the remaining contracts have already been
+closed. If the contract's settle time has passed, the code infers payout
+($1.00 or $0.00) by comparing the live BTC/ETH/SOL spot against the
+contract's strike and direction. Pre-expiry "position gone" (external sale)
+is conservatively recorded at $0.
+
+**Order mechanics:**
+- IOC (immediate-or-cancel) only — no resting GTC orders
+- Entry: `floor(bet_dollars / ask_price)` contracts
+- Entry price: `ask + 0.03` buffer to absorb stale-CSV spread
+- Partial IOC fills: unsold contracts stay open and are retried next poll; final PnL blends partial and full-exit legs

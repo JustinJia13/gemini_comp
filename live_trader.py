@@ -1,8 +1,8 @@
 """
 Live Prediction Market Trader — real money on Gemini Prediction Markets.
 
-Uses the exact same 6-model entry/exit logic as live_trading_sim.py, but
-places real orders via the Gemini trading API instead of just simulating.
+Uses the exact same 14-model + ensemble entry/exit logic as live_trading_sim.py,
+but places real orders via the Gemini trading API instead of just simulating.
 
 Each bet: $20 per trade (configurable via --bet-dollars or GEMINI_BET_DOLLARS env var).
 Orders use ``immediate-or-cancel`` — no dangling resting orders.
@@ -14,14 +14,14 @@ Usage:
 
     # Run live trader (same flags as live_trading_sim.py)
     python live_trader.py
-    python live_trader.py --bet-dollars 20 --min-edge 0.05
+    python live_trader.py --bet-dollars 20 --min-edge 0.07
     python live_trader.py --sandbox      # paper trading, no real money
 
     # Run without auto-starting data collectors (if running them separately)
     python live_trader.py --no-collectors
 
-All model/exit hyperparameters accept the same --lb-*, --profit-lock, etc.
-flags as live_trading_sim.py.  Defaults come from config.toml.
+All model/exit/confidence hyperparameters accept the same --lb-*, --profit-lock,
+--conf-*, etc. flags as live_trading_sim.py.  Defaults come from config.toml.
 
 IMPORTANT: Your Gemini API key must have NewOrder + CancelOrder permissions.
 Generate keys at: https://exchange.gemini.com/settings/api
@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 import config_loader as cfg
 from gemini_trader import GeminiTrader
@@ -40,25 +41,26 @@ from live_trading_sim import run
 
 
 def main() -> None:
-    _s  = cfg.section("simulation")
-    _ex = cfg.section("simulation.exit")
-    _lb = cfg.section("simulation.lookback")
+    _s   = cfg.section("simulation")
+    _ex  = cfg.section("simulation.exit")
+    _lb  = cfg.section("simulation.lookback")
+    _cf  = cfg.section("simulation.confidence")
 
     _lb_defaults = {
-        "gbm":           _lb.get("gbm",           24.0),
-        "ewma":          _lb.get("ewma",          48.0),
-        "garch":         _lb.get("garch",         72.0),
-        "stud":          _lb.get("stud",          48.0),
-        "skt":           _lb.get("skt",           48.0),
-        "heston":        _lb.get("heston",        96.0),
-        "hybrid":        _lb.get("hybrid",        48.0),
+        "gbm":           _lb.get("gbm",           12.0),
+        "ewma":          _lb.get("ewma",          24.0),
+        "garch":         _lb.get("garch",         48.0),
+        "stud":          _lb.get("stud",          24.0),
+        "skt":           _lb.get("skt",           24.0),
+        "heston":        _lb.get("heston",        72.0),
+        "hybrid":        _lb.get("hybrid",        24.0),
         "ou":            _lb.get("ou",            12.0),
-        "heston_ewma":   _lb.get("heston_ewma",   96.0),
+        "heston_ewma":   _lb.get("heston_ewma",   72.0),
         "gbm_jump":      _lb.get("gbm_jump",      24.0),
-        "ewma_jump":     _lb.get("ewma_jump",     48.0),
-        "garch_jump":    _lb.get("garch_jump",    72.0),
-        "student_t_jump":_lb.get("student_t_jump",48.0),
-        "hybrid_t_jump": _lb.get("hybrid_t_jump", 48.0),
+        "ewma_jump":     _lb.get("ewma_jump",     36.0),
+        "garch_jump":    _lb.get("garch_jump",    48.0),
+        "student_t_jump":_lb.get("student_t_jump",36.0),
+        "hybrid_t_jump": _lb.get("hybrid_t_jump", 36.0),
     }
 
     parser = argparse.ArgumentParser(
@@ -101,10 +103,10 @@ def main() -> None:
         default=None,
         metavar="MODEL",
         help=(
-            "Restrict entry to one or more models. "
+            "Add individual models that may also place orders alongside the ensemble. "
             f"Choices: {sorted(_VALID_MODELS)}. "
-            "Default: all 14 models. "
-            "Example: --model hybrid_t  or  --model hybrid_t hybrid_t_jump"
+            "Default: ensemble only (no individual model orders). "
+            "Example: --model skewed_t heston_ewma"
         ),
     )
 
@@ -112,6 +114,8 @@ def main() -> None:
     parser.add_argument("--poll-sec",            type=int,   default=_s.get("poll_sec",            60))
     parser.add_argument("--min-edge",            type=float, default=_s.get("min_edge",            0.03))
     parser.add_argument("--max-hours-to-settle", type=float, default=_s.get("max_hours_to_settle", 1.5))
+    parser.add_argument("--min-hours-to-settle", type=float, default=_s.get("min_hours_to_settle", 0.0),
+                        help="Skip contracts with less than this many hours to settle (avoids near-expiry illiquidity)")
     parser.add_argument("--profit-lock",         type=float, default=_ex.get("profit_lock",        0.05))
     parser.add_argument("--stop-loss",           type=float, default=_ex.get("stop_loss",          0.50))
     parser.add_argument("--p-drop",              type=float, default=_ex.get("p_drop",             0.05))
@@ -135,11 +139,35 @@ def main() -> None:
     parser.add_argument("--vol-veto-mult",  type=float, default=_s.get("vol_veto_mult", 2.0))
     parser.add_argument("--no-collectors", action="store_true",
                         help="Do not auto-start data collectors")
+    parser.add_argument("--trades-dir",    type=str,   default=None,
+                        help="Output directory for trades/ledger CSVs (default: .data/gemini/real_trades)")
+
+    # ── Confidence system ────────────────────────────────────────────────────
+    _cf_active_default = ",".join(_cf.get("active_models", [
+        "heston_ewma", "garch", "student_t", "skewed_t", "garch_jump", "gbm_jump"
+    ]))
+    parser.add_argument("--conf-pred-w",  type=float, default=_cf.get("pred_conf_weight",     0.55),
+                        help="λ1: weight for model-disagreement component of confidence")
+    parser.add_argument("--conf-data-w",  type=float, default=_cf.get("data_conf_weight",     0.10),
+                        help="λ2: weight for OHLCV data-gap component of confidence")
+    parser.add_argument("--conf-ens-w",   type=float, default=_cf.get("ensemble_conf_weight", 0.35),
+                        help="λ3: weight for directional-agreement component of confidence")
+    parser.add_argument("--conf-k",       type=float, default=_cf.get("pred_conf_k",          3.0),
+                        help="Harshness: pred_conf = max(0, 1 - k × std(p_fairs))")
+    parser.add_argument("--conf-active",  type=str,   default=_cf_active_default,
+                        help="Comma-separated model names for confidence computation")
 
     args = parser.parse_args()
 
+    # ── Parse confidence active models ────────────────────────────────────────
+    conf_active = [m.strip() for m in args.conf_active.split(",") if m.strip()] \
+                  if args.conf_active else None
+
     # ── Validate model selection ───────────────────────────────────────────────
-    active_models = None
+    # Default: ensemble-only (active_models=set() blocks all individual models;
+    # ensemble is exempt from this gate so it always runs).
+    # Pass --model to opt individual models back in alongside the ensemble.
+    active_models: set = set()
     if args.model is not None:
         bad = set(args.model) - _VALID_MODELS
         if bad:
@@ -172,19 +200,25 @@ def main() -> None:
     )
 
     mode        = "SANDBOX (paper trading)" if args.sandbox else "LIVE (real money)"
-    model_str   = ", ".join(sorted(active_models)) if active_models else "all 9"
+    model_str   = ", ".join(sorted(active_models)) if active_models else "ensemble only"
+    conf_str    = ", ".join(conf_active) if conf_active else "default"
     print(
         f"\n{'='*60}\n"
         f"  Gemini Prediction Markets — LIVE TRADER\n"
-        f"  Mode:    {mode}\n"
-        f"  Models:  {model_str}\n"
-        f"  Bet size: ${args.bet_dollars:.2f} per trade\n"
+        f"  Mode:       {mode}\n"
+        f"  Models:     {model_str}\n"
+        f"  Ensemble:   conf_active=[{conf_str}]\n"
+        f"  Bet size:   ${args.bet_dollars:.2f} per trade\n"
         f"{'='*60}\n"
     )
 
     # Pre-warm the symbol cache before the first poll
     trader.refresh_symbol_cache(force=True)
     print(f"  Symbol cache loaded: {len(trader._symbol_cache)} contracts\n")
+
+    # ── Resolve output directory ──────────────────────────────────────────────
+    from live_trading_sim import REAL_ROOT
+    sim_root = Path(args.trades_dir) if args.trades_dir else REAL_ROOT
 
     # ── Delegate to the simulation run loop with trader injected ──────────────
     run(
@@ -207,6 +241,7 @@ def main() -> None:
         },
         min_edge            = args.min_edge,
         max_hours_to_settle = args.max_hours_to_settle,
+        min_hours_to_settle = args.min_hours_to_settle,
         profit_lock         = args.profit_lock,
         stop_loss           = args.stop_loss,
         p_drop              = args.p_drop,
@@ -217,6 +252,12 @@ def main() -> None:
         no_collectors       = args.no_collectors,
         trader              = trader,
         active_models       = active_models,
+        sim_root            = sim_root,
+        conf_pred_w         = args.conf_pred_w,
+        conf_data_w         = args.conf_data_w,
+        conf_ens_w          = args.conf_ens_w,
+        conf_k              = args.conf_k,
+        conf_active         = conf_active,
     )
 
 

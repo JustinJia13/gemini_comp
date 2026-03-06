@@ -5,15 +5,34 @@ This workflow is implemented in [`btc_hourly_model.py`](../btc_hourly_model.py).
 ## What it does
 
 1. Loads Gemini minute OHLCV from `.data` files.
-2. Calibrates six models from rolling 1-minute log-return windows:
+2. Calibrates 14 models from rolling 1-minute log-return windows:
+
+   **Standalone volatility models (1–9):**
    - **GBM** — rolling σ, closed-form Black-Scholes binary price
    - **EWMA** — exponentially-weighted σ (λ = 0.94), same closed form
    - **GARCH(1,1)** — MLE-fit α, β, ω; longer lookback for stability
    - **Student-t** — fat-tail MC (20 k paths), fits ν from return series
    - **Skewed-t** — Fernández-Steel; γ (skew) from elastic-net on vol-return regression
    - **Heston SV** — full-truncation Euler MC; κ, ξ from AR(1) on hourly realised variance
+   - **Hybrid-t** — EWMA conditional σ + Student-t ν from EWMA residuals; regime-responsive
+   - **OU** — Ornstein-Uhlenbeck on log-price; captures mean-reversion
+   - **Heston-EWMA** — Heston with EWMA-calibrated long-run variance θ
+
+   **Merton jump-diffusion overlays (10–14):** each base model's drift/σ plus a
+   Poisson jump process (λ_J, μ_J, σ_J) calibrated from large-return outliers:
+   - **GBM + Jump**, **EWMA + Jump**, **GARCH + Jump**, **Student-t + Jump**, **Hybrid-t + Jump**
+
 3. Produces `P(settle_price > strike)` for each model independently.
 4. All calibration uses data strictly before the evaluation timestamp — no look-ahead.
+
+### Ensemble model (15th, synthetic)
+
+The live system also runs an **ensemble** that averages the YES probability
+across a configurable subset of the 14 models (`conf_active` list). The ensemble
+inherits the confidence system's directional-agreement and disagreement penalties,
+so it only enters when the underlying models broadly agree. In live trading the
+ensemble is the **default and only** order-placing agent; individual models are
+opt-in via `--model` in `live_trader.py`.
 
 ## Quick start
 

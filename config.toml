@@ -23,6 +23,7 @@ min_edge         = 0.07     # minimum model edge required to enter a trade
                             # (e.g. 0.03 = model must show 3 cents of edge at ask)
 max_hours_to_settle = 1.5   # ignore any contract settling more than this many hours
                             # away — guards against stale multi-day data in the CSV
+min_hours_to_settle = 0.0   # ignore contracts with less than this many hours to settle (0 = disabled)
 ewma_lambda      = 0.94     # EWMA decay factor λ (RiskMetrics default; higher = slower decay)
 rho              = -0.5     # prior price-vol correlation used to initialise skewed-t γ
                             # typical crypto: negative (vol rises when price falls)
@@ -73,3 +74,60 @@ ewma_jump     = 36.0   # EWMA + jump
 garch_jump    = 48.0   # GARCH + jump
 student_t_jump= 36.0   # StudentT + jump
 hybrid_t_jump = 36.0   # HybridT + jump
+
+# -----------------------------------------------------------------------------
+[simulation.confidence]
+# -----------------------------------------------------------------------------
+# Confidence system: adjusts raw model edge by a [0,1] composite score before
+# checking against min_edge.  edge_adj = raw_edge × total_conf.
+#
+# total_conf = pred_conf^λ1 × data_conf^λ2 × ensemble_conf^λ3
+#   λ weights must sum to 1.0 (weighted geometric mean stays in [0,1]).
+#   Setting a weight to 0 removes that component (x^0 = 1, neutral).
+#
+# pred_conf     = max(0, 1 - k × std(active_model p_fairs))
+#   k (pred_conf_k) controls harshness:
+#     k=3 → std=0.10 gives conf=0.70; std=0.33 gives conf=0.00
+#     k=5 → std=0.10 gives conf=0.50; std=0.20 gives conf=0.00  (was default — too harsh)
+#
+# data_conf     = min(1, n_actual_bars / n_expected_bars)
+#   Penalises OHLCV gaps; does NOT penalise short lookback windows
+#   (short windows are a deliberate regime-adaptation design choice).
+#
+# ensemble_conf = 0.5 + 0.5 × (n_agree / n_active_models)
+#   ∈ [0.5, 1.0]: 0.5 = half the models disagree; 1.0 = unanimous.
+
+pred_conf_weight     = 0.55    # λ1: model disagreement component
+data_conf_weight     = 0.10    # λ2: OHLCV data completeness component
+ensemble_conf_weight = 0.35    # λ3: directional agreement component
+pred_conf_k          = 3.0     # harshness: k=3 → std of 0.10 → conf=0.70
+
+# Models used to compute pred_conf (std of p_fairs) and ensemble_conf
+# (directional vote count).  Use the top-performing, diverse models.
+# Valid names: gbm, ewma, garch, student_t, skewed_t, heston, hybrid_t,
+#              ou, heston_ewma, gbm_jump, ewma_jump, garch_jump,
+#              student_t_jump, hybrid_t_jump
+active_models = ["heston_ewma", "garch", "student_t", "skewed_t", "garch_jump", "gbm_jump"]
+
+# -----------------------------------------------------------------------------
+[simulation.slippage]
+# -----------------------------------------------------------------------------
+# Sim-only friction model — makes simulation closer to live IOC execution.
+# All three parameters are disabled (0.0) in live trading (trader is set).
+#
+# zero_fill_prob  — probability that an entry order returns 0 fills.
+#   In live Gemini IOC trading, the market often moves between signal detection
+#   and order execution.  0.15 = 15% of entries are silently skipped.
+#   The contract stays eligible for re-evaluation on the next poll.
+#
+# entry_slip_max  — maximum additional cost added to entry ask (uniform [0, max]).
+#   Models the staleness of CSV ask prices + IOC execution friction.
+#   0.02 = at most 2¢ extra paid above the quoted ask (average cost = +1¢).
+#
+# exit_slip_max   — maximum bid penalty subtracted from the exit bid (uniform [0, max]).
+#   Models bid deterioration when we actually hit the bid to exit early.
+#   0.01 = at most 1¢ less received than the quoted bid (average = -0.5¢).
+
+zero_fill_prob = 0.15   # fraction of sim entry orders that simulate a zero IOC fill
+entry_slip_max = 0.02   # max extra cost at sim entry (¢ above quoted ask)
+exit_slip_max  = 0.01   # max bid penalty at sim early exit (¢ below quoted bid)
